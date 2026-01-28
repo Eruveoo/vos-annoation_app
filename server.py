@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import subprocess
 import uuid
@@ -7,8 +8,50 @@ from datetime import datetime
 from pathlib import Path
 import logging
 
-from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File
+# Add SAM-3 to path if not installed as a package
+# This handles cases where SAM-3 is a directory rather than an installed package
+# NOTE: For pkg_resources to work properly, SAM-3 should be installed as a package:
+#   pip install -e sam3/
+# If that's not possible, we add it to sys.path as a fallback.
+SAM3_PATHS = [
+    Path(__file__).parent / "sam3",  # Same directory as server.py (most common case)
+    Path("./sam3"),  # Current working directory
+    Path("../sam3"),  # One level up
+    Path(os.path.expanduser("~/sam3")),  # Home directory
+    Path("/scratch/project_2016918/sam3"),  # Common cluster location
+]
+
+sam3_found = False
+for sam3_path in SAM3_PATHS:
+    sam3_path = sam3_path.resolve()
+    # Check if this is the SAM-3 package directory (should contain sam3/ subdirectory)
+    if sam3_path.exists() and sam3_path.is_dir():
+        # Check if it contains the sam3 package
+        if (sam3_path / "sam3").exists() or (sam3_path / "sam3" / "__init__.py").exists():
+            if str(sam3_path) not in sys.path:
+                sys.path.insert(0, str(sam3_path))
+                logging.getLogger("uvicorn.error").info(f"Added SAM-3 path to sys.path: {sam3_path}")
+                sam3_found = True
+                break
+        # Also check if sam3_path itself is the package (i.e., contains model_builder.py)
+        elif (sam3_path / "model_builder.py").exists():
+            # This means sam3_path is already the sam3 package directory
+            parent = sam3_path.parent
+            if str(parent) not in sys.path:
+                sys.path.insert(0, str(parent))
+                logging.getLogger("uvicorn.error").info(f"Added SAM-3 parent path to sys.path: {parent}")
+                sam3_found = True
+                break
+
+if not sam3_found:
+    logging.getLogger("uvicorn.error").warning(
+        "SAM-3 package not found in common locations. "
+        "Please install SAM-3 as a package: pip install -e sam3/"
+    )
+
+from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File, BackgroundTasks
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Optional, Tuple
 
@@ -16,6 +59,16 @@ from typing import Dict, Optional, Tuple
 log = logging.getLogger("uvicorn.error")
 
 app = FastAPI()
+
+# Add CORS middleware to allow frontend requests
+# Allow all origins for development (restrict in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for now
+    allow_credentials=False,  # Must be False when allow_origins=["*"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------
 # Request logging middleware
@@ -38,7 +91,12 @@ VIDEO_NAME = "video1"
 JPEG_QUALITY = 90
 MASK_THRESHOLD = 0.5
 
-RUNS_ROOT = Path("runs")
+# Use scratch space (has most room for files):
+# - Home: 10GB space, 100K files (9.1G used, 6K files - space tight)
+# - Scratch: 4TB space, 1M files (54G used, 210K files - PLENTY OF ROOM!)
+# - Projappl: 50GB space, 100K files (21G used, 101K files - FILE LIMIT EXCEEDED!)
+RUNS_ROOT = Path("/scratch/project_2016918/vos_annotation_runs")
+RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
 LOG_EVERY_FRAMES_EXTRACT = 200
 LOG_EVERY_FRAMES_RENDER = 200
@@ -88,6 +146,7 @@ def random_color(seed: int):
 # -------------------------
 MODEL = None
 PROCESSOR = None
+VIDEO_PREDICTOR = None
 
 
 def get_model():
@@ -95,12 +154,221 @@ def get_model():
     if MODEL is None:
         log.info("Loading SAM-3 model...")
         t0 = time.perf_counter()
+        
+        # Check for Hugging Face token for gated model access
+        # Try multiple sources: environment variables, or saved token file
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        
+        # If not in environment, try reading from saved token file
+        # Check multiple locations: HF_HOME, then home directory
+        if not hf_token:
+            # Try HF_HOME first (if set)
+            hf_home = os.environ.get("HF_HOME")
+            if hf_home:
+                token_file = Path(hf_home) / "token"
+                if token_file.exists():
+                    try:
+                        hf_token = token_file.read_text().strip()
+                        log.info(f"Found Hugging Face token in HF_HOME: {token_file}")
+                    except Exception as e:
+                        log.warning(f"Could not read token file from HF_HOME: {e}")
+            
+            # Fallback to home directory
+            if not hf_token:
+                token_file = Path.home() / ".huggingface" / "token"
+                if token_file.exists():
+                    try:
+                        hf_token = token_file.read_text().strip()
+                        log.info("Found Hugging Face token in ~/.huggingface/token")
+                    except Exception as e:
+                        log.warning(f"Could not read token file: {e}")
+        
+        if hf_token:
+            log.info("Using Hugging Face token for authentication")
+            os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+        else:
+            log.warning("No Hugging Face token found. Model download may fail if not cached.")
+        
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
         MODEL = build_sam3_image_model()
         PROCESSOR = Sam3Processor(MODEL)
         log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s")
     return PROCESSOR
+
+
+def _gpu_ids():
+    """Get GPU IDs (exactly like testing_backend.py)"""
+    import torch
+    if torch.cuda.is_available():
+        return [torch.cuda.current_device()]
+    return []
+
+
+def get_video_predictor(force_reinit=False):
+    """Get SAM-3 video predictor for point-based refinement (1-frame video sessions)"""
+    global VIDEO_PREDICTOR
+    if VIDEO_PREDICTOR is None or force_reinit:
+        if force_reinit and VIDEO_PREDICTOR is not None:
+            log.warning("[VIDEO_PREDICTOR] Forcing reinitialization due to error")
+            VIDEO_PREDICTOR = None
+        log.info("Loading SAM-3 video predictor...")
+        t0 = time.perf_counter()
+        
+        # Check for Hugging Face token for gated model access
+        # Try multiple sources: environment variables, or saved token file
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        
+        # If not in environment, try reading from saved token file
+        # Check multiple locations: HF_HOME, then home directory
+        if not hf_token:
+            # Try HF_HOME first (if set)
+            hf_home = os.environ.get("HF_HOME")
+            if hf_home:
+                token_file = Path(hf_home) / "token"
+                if token_file.exists():
+                    try:
+                        hf_token = token_file.read_text().strip()
+                        log.info(f"[VIDEO_PREDICTOR] Found Hugging Face token in HF_HOME: {token_file}")
+                    except Exception as e:
+                        log.warning(f"[VIDEO_PREDICTOR] Could not read token file from HF_HOME: {e}")
+            
+            # Fallback to home directory
+            if not hf_token:
+                token_file = Path.home() / ".huggingface" / "token"
+                if token_file.exists():
+                    try:
+                        hf_token = token_file.read_text().strip()
+                        log.info("[VIDEO_PREDICTOR] Found Hugging Face token in ~/.huggingface/token")
+                    except Exception as e:
+                        log.warning(f"[VIDEO_PREDICTOR] Could not read token file: {e}")
+        
+        if hf_token:
+            log.info("[VIDEO_PREDICTOR] Using Hugging Face token for authentication")
+            os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+        else:
+            log.warning("[VIDEO_PREDICTOR] No Hugging Face token found. Model download may fail if not cached.")
+        
+        from sam3.model_builder import build_sam3_video_predictor
+        gpu_ids = _gpu_ids()  # Use same function as testing_backend
+        log.info(f"[VIDEO_PREDICTOR] Building with GPU IDs: {gpu_ids}")
+        VIDEO_PREDICTOR = build_sam3_video_predictor(gpus_to_use=gpu_ids)
+        log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s")
+    return VIDEO_PREDICTOR
+
+
+def extract_instances_from_formatted(formatted0, img_w=None, img_h=None):
+    """
+    Extract instances from formatted SAM3 output (exactly like testing_backend.py).
+    Returns list of dicts: [{"obj_id": int, "mask": HxW float(0/1), "score": float}, ...]
+    """
+    import numpy as np
+    import torch
+    from typing import Any, Dict, List
+    from PIL import Image
+    
+    instances: List[Dict[str, Any]] = []
+    
+    # Common pattern A: dict with "masks" + "obj_ids" (+ optional scores)
+    if isinstance(formatted0, dict):
+        if "masks" in formatted0 and formatted0["masks"] is not None:
+            masks = formatted0["masks"]
+            obj_ids = formatted0.get("obj_ids", formatted0.get("object_ids"))
+            scores = formatted0.get("scores", formatted0.get("ious", formatted0.get("iou_predictions")))
+            masks_np = np.asarray(masks)
+            if masks_np.ndim == 2:
+                masks_np = masks_np[None, :, :]
+            if obj_ids is None:
+                obj_ids_list = list(range(masks_np.shape[0]))
+            else:
+                obj_ids_list = [int(x) for x in np.asarray(obj_ids).reshape(-1).tolist()]
+            if scores is None:
+                scores_list = [1.0] * len(obj_ids_list)
+            else:
+                scores_list = [float(x) for x in np.asarray(scores).reshape(-1).tolist()]
+            for i, oid in enumerate(obj_ids_list):
+                mask_val = masks_np[i]
+                if isinstance(mask_val, torch.Tensor):
+                    mask_val = mask_val.squeeze().cpu().numpy()
+                instances.append(
+                    dict(obj_id=int(oid), mask=mask_val.astype(np.float32), score=float(scores_list[i] if i < len(scores_list) else 1.0))
+                )
+            return instances
+        
+        # Common pattern B: dict keyed by obj_id -> dict with "mask"
+        keys = list(formatted0.keys())
+        looks_like_obj_map = len(keys) > 0 and all((isinstance(k, int) or (isinstance(k, str) and k.isdigit())) for k in keys)
+        if looks_like_obj_map:
+            for k in keys:
+                oid = int(k) if not isinstance(k, int) else k
+                v = formatted0[k]
+                if isinstance(v, dict):
+                    m = v.get("mask", v.get("masks"))
+                    if m is None:
+                        continue
+                    if isinstance(m, torch.Tensor):
+                        m = m.squeeze().cpu().numpy()
+                    score = v.get("score", v.get("iou", 1.0))
+                    instances.append(dict(obj_id=int(oid), mask=np.asarray(m).astype(np.float32), score=float(score)))
+                else:
+                    # value itself is mask
+                    if isinstance(v, torch.Tensor):
+                        v = v.squeeze().cpu().numpy()
+                    instances.append(dict(obj_id=int(oid), mask=np.asarray(v).astype(np.float32), score=1.0))
+            return instances
+        
+        # Common pattern C: dict with "objects" list
+        if "objects" in formatted0 and isinstance(formatted0["objects"], list):
+            for obj in formatted0["objects"]:
+                if not isinstance(obj, dict):
+                    continue
+                oid = obj.get("obj_id", obj.get("id", obj.get("object_id")))
+                m = obj.get("mask", obj.get("masks"))
+                if oid is None or m is None:
+                    continue
+                if isinstance(m, torch.Tensor):
+                    m = m.squeeze().cpu().numpy()
+                score = obj.get("score", obj.get("iou", 1.0))
+                instances.append(dict(obj_id=int(oid), mask=np.asarray(m).astype(np.float32), score=float(score)))
+            return instances
+    
+    # Pattern D: list of objects
+    if isinstance(formatted0, list):
+        for i, obj in enumerate(formatted0):
+            if isinstance(obj, dict):
+                oid = obj.get("obj_id", obj.get("id", obj.get("object_id", i)))
+                m = obj.get("mask", obj.get("masks"))
+                if m is None:
+                    continue
+                if isinstance(m, torch.Tensor):
+                    m = m.squeeze().cpu().numpy()
+                score = obj.get("score", obj.get("iou", 1.0))
+                instances.append(dict(obj_id=int(oid), mask=np.asarray(m).astype(np.float32), score=float(score)))
+            else:
+                # list of masks
+                if isinstance(obj, torch.Tensor):
+                    obj = obj.squeeze().cpu().numpy()
+                instances.append(dict(obj_id=i, mask=np.asarray(obj).astype(np.float32), score=1.0))
+        return instances
+    
+    return instances
+
+
+def safe_mask_hw(mask, h: int, w: int):
+    """
+    Ensure mask is HxW float32 in [0,1] (exactly like testing_backend.py).
+    """
+    import numpy as np
+    import cv2
+    m = mask.astype(np.float32)
+    if m.ndim == 3 and m.shape[0] == 1:
+        m = m[0]
+    if m.shape != (h, w):
+        m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+    # normalize if it came as 0/255
+    if m.max() > 1.5:
+        m = (m > 127).astype(np.float32)
+    return (m > 0.5).astype(np.float32)
 
 def _ffmpeg_reencode_video(in_mp4: Path, out_mp4: Path, fps: float) -> bool:
     """
@@ -127,12 +395,24 @@ def _ffmpeg_reencode_video(in_mp4: Path, out_mp4: Path, fps: float) -> bool:
         str(out_mp4),
     ]
     log.info(f"Re-encoding video: {' '.join(cmd)}")
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    
-    if p.returncode != 0:
-        log.error(f"ffmpeg re-encode failed with return code {p.returncode}")
-        log.error(f"ffmpeg output:\n{p.stdout[-2000:] if p.stdout else '(no output)'}")
-        return False
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        
+        if p.returncode != 0:
+            log.error(f"ffmpeg re-encode failed with return code {p.returncode}")
+            log.error(f"ffmpeg output:\n{p.stdout[-2000:] if p.stdout else '(no output)'}")
+            return False
+    except FileNotFoundError:
+        log.warning(f"ffmpeg not found in PATH. Skipping re-encoding - video may not be browser-compatible.")
+        log.warning(f"To fix: install ffmpeg or load the ffmpeg module (e.g., 'module load ffmpeg')")
+        # Copy the original file as-is (may not be browser-compatible)
+        try:
+            shutil.copy2(in_mp4, out_mp4)
+            log.warning(f"Copied original video without re-encoding: {out_mp4}")
+            return True
+        except Exception as e:
+            log.error(f"Failed to copy video: {e}")
+            return False
     
     if not out_mp4.exists():
         log.error(f"Output video was not created: {out_mp4}")
@@ -175,12 +455,24 @@ def _ffmpeg_drop_seed_frame(in_mp4: Path, out_mp4: Path, fps: float) -> bool:
         str(out_mp4),
     ]
     log.info(f"Running ffmpeg drop-seed: {' '.join(cmd)}")
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    
-    if p.returncode != 0:
-        log.error(f"ffmpeg drop-seed failed with return code {p.returncode}")
-        log.error(f"ffmpeg output:\n{p.stdout[-2000:] if p.stdout else '(no output)'}")
-        return False
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        
+        if p.returncode != 0:
+            log.error(f"ffmpeg drop-seed failed with return code {p.returncode}")
+            log.error(f"ffmpeg output:\n{p.stdout[-2000:] if p.stdout else '(no output)'}")
+            return False
+    except FileNotFoundError:
+        log.warning(f"ffmpeg not found in PATH. Cannot drop seed frame - video may not be browser-compatible.")
+        log.warning(f"To fix: install ffmpeg or load the ffmpeg module (e.g., 'module load ffmpeg')")
+        # Copy the original file as-is (may not be browser-compatible)
+        try:
+            shutil.copy2(in_mp4, out_mp4)
+            log.warning(f"Copied original video without dropping seed frame: {out_mp4}")
+            return True
+        except Exception as e:
+            log.error(f"Failed to copy video: {e}")
+            return False
     
     if not out_mp4.exists():
         log.error(f"Output video was not created: {out_mp4}")
@@ -199,34 +491,124 @@ def _ffmpeg_drop_seed_frame(in_mp4: Path, out_mp4: Path, fps: float) -> bool:
 # Core pipeline
 # -------------------------
 def extract_frames(video_path: str, jpeg_dir: Path):
+    """
+    Extract frames from video using OpenCV, with ffmpeg fallback if OpenCV fails.
+    """
     import cv2
 
     log.info(f"Extracting frames from {video_path}")
+    
+    # Check if file exists
+    if not os.path.exists(video_path):
+        raise RuntimeError(f"Video file does not exist: {video_path}")
+    
+    file_size = os.path.getsize(video_path)
+    log.info(f"Video file size: {file_size} bytes")
+    if file_size == 0:
+        raise RuntimeError(f"Video file is empty: {video_path}")
+    
     t0 = time.perf_counter()
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
+    # Try OpenCV first
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"OpenCV cannot open video: {video_path}")
+        
+        # Set timeout for reading (30 seconds)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frames = []
-    idx = 0
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            log.warning(f"OpenCV could not determine FPS, trying ffmpeg fallback")
+            cap.release()
+            raise RuntimeError("OpenCV failed to read video properties")
+        
+        frames = []
+        idx = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        fname = f"{idx:05d}.jpg"
-        cv2.imwrite(str(jpeg_dir / fname), frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        frames.append(fname)
-        idx += 1
-        if idx % LOG_EVERY_FRAMES_EXTRACT == 0:
-            log.info(f"  extracted {idx} frames...")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            fname = f"{idx:05d}.jpg"
+            cv2.imwrite(str(jpeg_dir / fname), frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+            frames.append(fname)
+            idx += 1
+            if idx % LOG_EVERY_FRAMES_EXTRACT == 0:
+                log.info(f"  extracted {idx} frames...")
 
-    cap.release()
-    log.info(f"Frame extraction done: {len(frames)} frames ({time.perf_counter()-t0:.2f}s)")
+        cap.release()
+        
+        if len(frames) == 0:
+            raise RuntimeError("OpenCV extracted 0 frames")
+        
+        log.info(f"Frame extraction done: {len(frames)} frames ({time.perf_counter()-t0:.2f}s)")
+        return frames, fps
+        
+    except Exception as e:
+        log.warning(f"OpenCV extraction failed: {e}, trying ffmpeg fallback")
+        # Fallback to ffmpeg
+        return _extract_frames_ffmpeg(video_path, jpeg_dir)
+
+
+def _extract_frames_ffmpeg(video_path: str, jpeg_dir: Path):
+    """
+    Extract frames using ffmpeg (more robust for problematic videos).
+    """
+    log.info(f"Using ffmpeg to extract frames from {video_path}")
+    t0 = time.perf_counter()
+    
+    # Get FPS using ffprobe
+    fps_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    try:
+        fps_result = subprocess.run(fps_cmd, capture_output=True, text=True)
+        if fps_result.returncode != 0:
+            raise RuntimeError(f"ffprobe failed to get FPS: {fps_result.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe not found in PATH. Please install ffmpeg (which includes ffprobe).")
+    
+    fps_str = fps_result.stdout.strip()
+    if "/" in fps_str:
+        num, den = map(int, fps_str.split("/"))
+        fps = num / den if den > 0 else 30.0
+    else:
+        fps = float(fps_str) if fps_str else 30.0
+    
+    log.info(f"Detected FPS: {fps}")
+    
+    # Extract frames using ffmpeg
+    output_pattern = str(jpeg_dir / "%05d.jpg")
+    cmd = [
+        "ffmpeg", "-i", str(video_path),
+        "-q:v", "2",  # High quality JPEG
+        "-vsync", "0",  # Extract all frames
+        output_pattern
+    ]
+    
+    log.info(f"Running ffmpeg: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            log.error(f"ffmpeg extraction failed: {result.stderr}")
+            raise RuntimeError(f"ffmpeg failed to extract frames: {result.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found in PATH. Please install ffmpeg or load the ffmpeg module (e.g., 'module load ffmpeg'). Frame extraction requires ffmpeg when OpenCV fails.")
+    
+    # List extracted frames
+    frames = sorted([f.name for f in jpeg_dir.glob("*.jpg")])
+    
     if len(frames) == 0:
-        raise RuntimeError("No frames extracted.")
+        raise RuntimeError("ffmpeg extracted 0 frames")
+    
+    log.info(f"Frame extraction done: {len(frames)} frames ({time.perf_counter()-t0:.2f}s)")
     return frames, fps
 
 
@@ -524,12 +906,27 @@ def run_xmem(dataset_root: Path, xmem_output: Path):
         "--generic_path", os.path.abspath(dataset_root),
     ]
 
+    # Set TORCH_HOME and TMPDIR to use scratch space (avoid /tmp being full)
+    # PyTorch will cache pretrained models (like ResNet50) here
+    # TMPDIR is used for temporary extraction during download
+    torch_cache_dir = Path("/scratch/project_2016918/torch_cache")
+    torch_cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path("/scratch/project_2016918/tmp")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["TORCH_HOME"] = str(torch_cache_dir)
+    env["TMPDIR"] = str(tmp_dir)
+    env["TMP"] = str(tmp_dir)  # Some tools use TMP instead of TMPDIR
+    log.info(f"[XMem] Using TORCH_HOME={torch_cache_dir} for model cache")
+    log.info(f"[XMem] Using TMPDIR={tmp_dir} for temporary files")
+
     proc = subprocess.Popen(
         cmd,
         cwd=XMEM_REPO,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
     )
 
     logs = []
@@ -730,7 +1127,15 @@ def _ffmpeg_concat(a: Path, b: Path, out: Path, fps: float) -> bool:
         str(tmp_out),
     ]
     log.info(f"Re-encoding concat (browser-compatible): {' '.join(cmd)}")
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        log.error(f"ffmpeg not found in PATH. Cannot concatenate videos.")
+        log.error(f"To fix: install ffmpeg or load the ffmpeg module (e.g., 'module load ffmpeg')")
+        # Clean up temp files
+        if tmp_list.exists():
+            tmp_list.unlink()
+        return False
     
     if not (p.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 0):
         # If concat failed, the first video (a) might be corrupted - try re-encoding it first
@@ -747,7 +1152,16 @@ def _ffmpeg_concat(a: Path, b: Path, out: Path, fps: float) -> bool:
             log.info(f"Updated concat list:\n{list_content}")
             
             # Retry concat
-            p2 = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                p2 = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            except FileNotFoundError:
+                log.error(f"ffmpeg not found during retry. Cannot concatenate videos.")
+                # Clean up temp files
+                if tmp_list.exists():
+                    tmp_list.unlink()
+                if a_reencoded.exists():
+                    a_reencoded.unlink()
+                return False
             if p2.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 0:
                 log.info("Concat succeeded after re-encoding first video")
                 a_reencoded.unlink(missing_ok=True)  # Clean up temp file
@@ -926,6 +1340,10 @@ class IDMapping(BaseModel):
     mapping: Dict[str, int]
 
 
+class PreviewUpdate(BaseModel):
+    mapping: Dict[str, int]  # mask_index -> final_id (0 means delete)
+
+
 @app.post("/match_init_ids/{run_id}")
 def match_init_ids(run_id: str, file: UploadFile = File(...)):
     """
@@ -1051,6 +1469,110 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
         "mask_assignments": mask_assignments,
         "matched_count": matched_count,
         "total_count": total_count,
+        "image": f"data:image/jpeg;base64,{image_b64}",
+    })
+
+
+@app.post("/preview_init_update/{run_id}")
+def preview_init_update(run_id: str, preview_update: PreviewUpdate):
+    """
+    Regenerate frame 0 preview image with current ID mappings and deletions.
+    Used for real-time preview updates as user edits the table.
+    """
+    import numpy as np
+    import cv2
+    from PIL import Image
+    from fastapi.responses import JSONResponse
+    
+    log.info(f"/preview_init_update run_id={run_id}")
+    log.info(f"Preview update mapping: {preview_update.mapping}")
+    
+    run_dir = RUNS_ROOT / run_id
+    if not run_dir.exists():
+        raise HTTPException(404, f"Run not found: {run_id}")
+    
+    # Load saved masks from init
+    masks_file = run_dir / "init_masks.npy"
+    if not masks_file.exists():
+        raise HTTPException(400, "Masks not found. Please run /init first.")
+    
+    masks = np.load(masks_file, allow_pickle=True)
+    log.info(f"[PREVIEW_INIT_UPDATE] Loaded {len(masks)} masks from init")
+    
+    # Load frame 0 image
+    src_root = run_dir / "xmem_generic"
+    jpeg_dir = src_root / "JPEGImages" / VIDEO_NAME
+    frame_path = jpeg_dir / "00000.jpg"
+    
+    if not frame_path.exists():
+        raise HTTPException(404, "Frame 0 not found")
+    
+    frame = cv2.imread(str(frame_path))
+    if frame is None:
+        raise HTTPException(500, "Could not read frame 0")
+    frame = frame.copy()  # Make a copy to avoid modifying original
+    
+    def color_for(i: int):
+        np.random.seed(i * 42)
+        return tuple(map(int, np.random.randint(0, 255, 3)))
+    
+    # Render masks with user's current ID mappings (skip deleted ones)
+    rendered_count = 0
+    for mask_idx_str, final_id in preview_update.mapping.items():
+        mask_idx = int(mask_idx_str)
+        if mask_idx >= len(masks):
+            continue
+        
+        # Skip deleted masks (ID 0 or negative)
+        if final_id <= 0:
+            continue
+        
+        mask = masks[mask_idx]
+        # Ensure mask is boolean
+        if not isinstance(mask, np.ndarray):
+            mask = np.asarray(mask)
+        if mask.dtype != bool:
+            mask = (mask > 0.5).astype(bool)
+        
+        col = color_for(final_id)
+        overlay = frame.copy()
+        overlay[mask] = col
+        frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
+        
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            continue
+        cx, cy = int(xs.mean()), int(ys.mean())
+        
+        text = str(final_id)
+        font_scale = 0.8
+        thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        text_x = cx - text_width // 2
+        text_y = cy + text_height // 2
+        
+        cv2.putText(
+            frame,
+            text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        rendered_count += 1
+    
+    log.info(f"Rendered {rendered_count} masks in preview")
+    
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to encode frame")
+    
+    import base64
+    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    
+    return JSONResponse(content={
         "image": f"data:image/jpeg;base64,{image_b64}",
     })
 
@@ -1569,6 +2091,27 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
     )
 
     tracked_path = run_dir / "tracked.mp4"
+    
+    # Re-encode tracked.mp4 to ensure browser-compatible format (H.264)
+    # This fixes the issue where mp4v codec fallback isn't supported by browsers
+    # Only re-encode if the file exists and has content
+    if tracked_path.exists() and tracked_path.stat().st_size > 0:
+        log.info(f"[TRACK] Re-encoding tracked.mp4 to browser-compatible H.264 format...")
+        tracked_tmp = run_dir / "tracked_tmp.mp4"
+        if _ffmpeg_reencode_video(tracked_path, tracked_tmp, fps):
+            # Verify the re-encoded file is valid before replacing
+            if tracked_tmp.exists() and tracked_tmp.stat().st_size > 0:
+                tracked_tmp.replace(tracked_path)
+                log.info(f"[TRACK] ✅ tracked.mp4 re-encoded successfully")
+            else:
+                log.warning(f"[TRACK] ⚠️  Re-encoded file is invalid, keeping original")
+                if tracked_tmp.exists():
+                    tracked_tmp.unlink()
+        else:
+            log.warning(f"[TRACK] ⚠️  Re-encoding failed, keeping original (may not work in browser)")
+    else:
+        log.warning(f"[TRACK] ⚠️  tracked.mp4 doesn't exist or is empty, skipping re-encode")
+    
     chunk_new = chunk_root / "chunk_new.mp4"   # stored with the chunk
     log.info(f"Preparing chunk_new.mp4: dropping seed frame from {tracked_path} -> {chunk_new}")
     ok = _ffmpeg_drop_seed_frame(tracked_path, chunk_new, fps)
@@ -1598,13 +2141,22 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
     }
 
 def _probe_duration(path: Path) -> float | None:
+    """Get video duration using ffprobe. Returns None if ffprobe is not available or fails."""
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        return None
     try:
-        return float(p.stdout.strip())
-    except:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if p.returncode != 0:
+            return None
+        try:
+            return float(p.stdout.strip())
+        except:
+            return None
+    except FileNotFoundError:
+        # ffprobe not found in PATH - this is non-critical, just return None
+        log.warning(f"ffprobe not found in PATH, cannot probe video duration for {path}")
+        return None
+    except Exception as e:
+        log.warning(f"Error probing video duration: {e}")
         return None
 
 
@@ -2520,6 +3072,9 @@ def prepare_correction(run_id: str, frame_idx: int):
     commit_up_to = frame_idx - 1
     log.info(f"[DEBUG] Need to commit frames up to: {commit_up_to}, current max_idx: {max_idx}")
     
+    # Define golden_ann_dir early (used later for getting existing IDs)
+    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    
     committed_count = 0
     if commit_up_to > max_idx:
         # Need to commit more frames from the last chunk
@@ -2538,8 +3093,7 @@ def prepare_correction(run_id: str, frame_idx: int):
         log.info(f"[DEBUG] Chunk info: seed_idx={seed_idx}, end_idx={end_idx}")
         log.info(f"[DEBUG] Will commit frames: {seed_idx+1}..{min(commit_up_to, end_idx)}")
         
-        golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
-        ensure_dir(golden_ann_dir)
+        ensure_dir(golden_ann_dir)  # golden_ann_dir already defined above
         
         # Also copy JPEG frames
         golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
@@ -2818,20 +3372,501 @@ class RefineMaskRequest(BaseModel):
     mask_index: int
     points: list[PointPrompt]  # Accumulated points for this mask
 
-class PreviewUpdate(BaseModel):
-    mapping: Dict[str, int]  # mask_index -> final_id (0 means delete)
+class AddMaskRequest(BaseModel):
+    point: PointPrompt  # Single point to create a new mask
+
+@app.post("/add_mask/{run_id}/{frame_idx}")
+def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
+    """
+    Add a new mask using a point prompt with SAM-3 video predictor (1-frame video session).
+    This creates a new mask from scratch using a positive point prompt.
+    """
+    import numpy as np
+    import cv2
+    import tempfile
+    import shutil
+    from PIL import Image
+    from fastapi.responses import JSONResponse
+    from sam3.visualization_utils import prepare_masks_for_visualization
+    
+    log.info(f"[ADD_MASK] ========== ADD NEW MASK ==========")
+    log.info(f"/add_mask run_id={run_id} frame_idx={frame_idx} point=({add_request.point.x}, {add_request.point.y}, positive={add_request.point.is_positive})")
+    
+    run_dir = RUNS_ROOT / run_id
+    if not run_dir.exists():
+        raise HTTPException(404, f"Run not found: {run_id}")
+    
+    # Load existing masks from prepare_correction (or create empty array if none exist)
+    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    if masks_file.exists():
+        masks_raw = np.load(masks_file, allow_pickle=True)
+        # Convert to list and ensure each mask is a numpy array
+        if isinstance(masks_raw, np.ndarray):
+            masks = [m if isinstance(m, np.ndarray) else np.array(m) for m in masks_raw]
+        else:
+            masks = [np.array(m) if not isinstance(m, np.ndarray) else m for m in masks_raw]
+        log.info(f"[ADD_MASK] Loaded {len(masks)} existing masks from {masks_file}")
+        for i, m in enumerate(masks[:3]):  # Log first 3 masks
+            log.info(f"[ADD_MASK]   Mask {i}: type={type(m)}, dtype={getattr(m, 'dtype', 'N/A')}, shape={getattr(m, 'shape', 'N/A')}")
+    else:
+        masks = []
+        log.info(f"[ADD_MASK] No existing masks found, starting with empty list")
+    
+    # Load ID assignments to identify deleted masks (ID <= 0 or missing from assignments)
+    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    id_assignments = {}
+    if assignments_file.exists():
+        id_assignments = np.load(assignments_file, allow_pickle=True).item()
+        log.info(f"[ADD_MASK] Loaded ID assignments: {id_assignments}")
+    else:
+        # If no assignments file, create default (all masks have valid IDs)
+        id_assignments = {i: i + 1 for i in range(len(masks))}
+        log.info(f"[ADD_MASK] No assignments file found, using default assignments: {id_assignments}")
+    
+    # Identify which masks are deleted:
+    # 1. Masks with ID <= 0 in assignments
+    # 2. Masks that exist in the masks file but are NOT in assignments (were deleted by removing from mapping)
+    deleted_mask_indices = set()
+    for idx in range(len(masks)):
+        if idx in id_assignments:
+            if id_assignments[idx] <= 0:
+                deleted_mask_indices.add(idx)
+        else:
+            # Mask exists in file but not in assignments - it was deleted
+            deleted_mask_indices.add(idx)
+    
+    if deleted_mask_indices:
+        log.info(f"[ADD_MASK] Found {len(deleted_mask_indices)} deleted masks (indices: {sorted(deleted_mask_indices)})")
+    
+    # Load frame image
+    meta = parse_meta_file(run_dir / "meta.txt")
+    src_root = run_dir / "xmem_generic"
+    jpeg_dir = src_root / "JPEGImages" / VIDEO_NAME
+    frame_path = jpeg_dir / f"{frame_idx:05d}.jpg"
+    
+    if not frame_path.exists():
+        raise HTTPException(404, f"Frame {frame_idx} not found")
+    
+    img = Image.open(frame_path).convert("RGB")
+    W, H = img.size
+    log.info(f"[ADD_MASK] Frame dimensions: {W}x{H}")
+    
+    # Validate point is within image bounds
+    if not (0 <= add_request.point.x < W and 0 <= add_request.point.y < H):
+        raise HTTPException(400, f"Point ({add_request.point.x}, {add_request.point.y}) is outside image bounds ({W}x{H})")
+    
+    # Use video predictor with 1-frame video session (exactly like refine_mask)
+    predictor = get_video_predictor()
+    
+    # Create temporary 1-frame video folder
+    tmpdir = tempfile.mkdtemp(prefix="sam3_add_mask_")
+    try:
+        # Load image and save as JPEG
+        import cv2
+        img = Image.open(frame_path).convert("RGB")
+        image_np = np.array(img)
+        frame_tmp_path = Path(tmpdir) / "00000.jpg"
+        bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        ok = cv2.imwrite(str(frame_tmp_path), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError("Failed to write temporary frame for SAM3 session")
+        
+        # Start session
+        resp = predictor.handle_request(
+            request=dict(
+                type="start_session",
+                resource_path=str(tmpdir),
+            )
+        )
+        session_id = resp["session_id"]
+        log.info(f"[ADD_MASK] Started session {session_id}")
+        
+        # Step 1: Add text prompt first to establish objects (like refine_mask does)
+        meta = parse_meta_file(run_dir / "meta.txt")
+        prompt = meta.get("prompt", "object")
+        log.info(f"[ADD_MASK] Step 1: Adding text prompt '{prompt}' to establish objects")
+        text_request_dict = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": prompt,
+        }
+        log.info(f"[ADD_MASK] Text request: keys={list(text_request_dict.keys())}, has 'points': {'points' in text_request_dict}, has 'obj_id': {'obj_id' in text_request_dict}")
+        
+        # Retry logic for BFloat16 errors (SAM-3 internal issue)
+        max_retries = 2
+        for retry in range(max_retries):
+            try:
+                _ = predictor.handle_request(request=text_request_dict)
+                log.info(f"[ADD_MASK] Text prompt added successfully")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                log.error(f"[ADD_MASK] Error adding text prompt (attempt {retry+1}/{max_retries}): {error_msg}")
+                log.error(f"[ADD_MASK] Error type: {type(e).__name__}")
+                
+                if "BFloat16" in error_msg or "bias type" in error_msg:
+                    log.error("[ADD_MASK] BFloat16 dtype error detected - this is a SAM-3 model state issue")
+                    if retry < max_retries - 1:
+                        log.warning("[ADD_MASK] Reinitializing predictor and retrying...")
+                        # Close current session before reinitializing
+                        try:
+                            predictor.handle_request(request=dict(type="close_session", session_id=session_id))
+                        except:
+                            pass
+                        # Reinitialize predictor
+                        predictor = get_video_predictor(force_reinit=True)
+                        # Restart session
+                        resp = predictor.handle_request(
+                            request=dict(
+                                type="start_session",
+                                resource_path=str(tmpdir),
+                            )
+                        )
+                        session_id = resp["session_id"]
+                        log.info(f"[ADD_MASK] Restarted session {session_id} after reinit")
+                        # Update text_request_dict with new session_id
+                        text_request_dict["session_id"] = session_id
+                        continue
+                    else:
+                        raise RuntimeError("SAM-3 model dtype error (BFloat16/bias mismatch) persisted after retries. Please try again later.") from e
+                raise
+        
+        # Step 2: Propagate to get initial masks
+        log.info(f"[ADD_MASK] Step 2: Propagating after text prompt to get initial masks...")
+        outputs0_initial = None
+        for resp in predictor.handle_stream_request(
+            request=dict(type="propagate_in_video", session_id=session_id)
+        ):
+            if resp.get("frame_index") == 0:
+                outputs0_initial = resp.get("outputs")
+                break
+        
+        if outputs0_initial is None:
+            raise RuntimeError("SAM3 propagate_in_video did not return frame 0 outputs")
+        
+        # Format and extract initial instances (we need this to determine a new obj_id)
+        formatted0_initial = prepare_masks_for_visualization({0: outputs0_initial})[0]
+        inst_list_initial = extract_instances_from_formatted(formatted0_initial)
+        log.info(f"[ADD_MASK] Text prompt found {len(inst_list_initial)} initial instances (ignoring them - creating new mask)")
+        
+        # Step 3: Add point prompt to create NEW mask (always create new, don't check existing masks)
+        if not add_request.point.is_positive:
+            log.warning(f"[ADD_MASK] Point is negative, but converting to positive for new mask creation")
+        
+        points_xy = np.array([[add_request.point.x, add_request.point.y]], dtype=np.float32)
+        labels = np.array([1], dtype=np.int32)  # Always positive for new mask
+        
+        # WORKAROUND: Duplicate single point (SAM-3 quirk)
+        if len(points_xy) == 1:
+            log.info(f"[ADD_MASK] WORKAROUND: Duplicating single point to work around SAM-3 quirk")
+            points_xy = np.vstack([points_xy, points_xy])
+            labels = np.append(labels, labels[0])
+        
+        # Convert to relative coordinates
+        points_rel = points_xy.copy()
+        points_rel[:, 0] /= float(W)
+        points_rel[:, 1] /= float(H)
+        
+        log.info(f"[ADD_MASK] Step 3: Adding point prompt to create NEW mask (not touching existing masks)")
+        
+        # Always create a new obj_id (max from text prompt + 1)
+        import torch
+        points_tensor = torch.tensor(points_rel, dtype=torch.float32)
+        labels_tensor = torch.tensor(labels, dtype=torch.int32)
+        
+        max_obj_id = max([int(inst.get("obj_id", 0)) for inst in inst_list_initial], default=0)
+        new_obj_id = max_obj_id + 1
+        log.info(f"[ADD_MASK] Creating new mask with obj_id={new_obj_id} (not checking existing saved masks)")
+        
+        points_request = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "points": points_tensor,
+            "point_labels": labels_tensor,
+            "obj_id": int(new_obj_id),
+        }
+        
+        log.info(f"[ADD_MASK] Calling predictor.handle_request with point prompts (obj_id={points_request.get('obj_id')})...")
+        
+        # Retry logic for BFloat16 errors (SAM-3 internal issue)
+        max_retries = 2
+        for retry in range(max_retries):
+            try:
+                _ = predictor.handle_request(request=points_request)
+                log.info(f"[ADD_MASK] ✓ Point prompts added successfully")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                log.error(f"[ADD_MASK] Error adding point prompts (attempt {retry+1}/{max_retries}): {error_msg}")
+                log.error(f"[ADD_MASK] Error type: {type(e).__name__}")
+                
+                if "BFloat16" in error_msg or "bias type" in error_msg:
+                    log.error("[ADD_MASK] BFloat16 dtype error detected - this is a SAM-3 model state issue")
+                    if retry < max_retries - 1:
+                        log.warning("[ADD_MASK] Reinitializing predictor and retrying...")
+                        # Close current session before reinitializing
+                        try:
+                            predictor.handle_request(request=dict(type="close_session", session_id=session_id))
+                        except:
+                            pass
+                        # Reinitialize predictor
+                        predictor = get_video_predictor(force_reinit=True)
+                        # Restart session
+                        resp = predictor.handle_request(
+                            request=dict(
+                                type="start_session",
+                                resource_path=str(tmpdir),
+                            )
+                        )
+                        session_id = resp["session_id"]
+                        log.info(f"[ADD_MASK] Restarted session {session_id} after reinit")
+                        
+                        # Re-add text prompt
+                        text_request_dict = {
+                            "type": "add_prompt",
+                            "session_id": session_id,
+                            "frame_index": 0,
+                            "text": prompt,
+                        }
+                        _ = predictor.handle_request(request=text_request_dict)
+                        log.info(f"[ADD_MASK] Re-added text prompt after reinit")
+                        
+                        # Re-propagate to get initial masks
+                        outputs0_initial = None
+                        for resp in predictor.handle_stream_request(
+                            request=dict(type="propagate_in_video", session_id=session_id)
+                        ):
+                            if resp.get("frame_index") == 0:
+                                outputs0_initial = resp.get("outputs")
+                                break
+                        
+                        if outputs0_initial is None:
+                            raise RuntimeError("SAM3 propagate_in_video did not return frame 0 outputs after reinit")
+                        
+                        formatted0_initial = prepare_masks_for_visualization({0: outputs0_initial})[0]
+                        inst_list_initial = extract_instances_from_formatted(formatted0_initial)
+                        
+                        # Always use a new obj_id (don't check existing masks)
+                        max_obj_id = max([int(inst.get("obj_id", 0)) for inst in inst_list_initial], default=0)
+                        points_request["obj_id"] = max_obj_id + 1
+                        
+                        # Update session_id in points_request
+                        points_request["session_id"] = session_id
+                        continue
+                    else:
+                        raise RuntimeError("SAM-3 model dtype error (BFloat16/bias mismatch) persisted after retries. Please try again later.") from e
+                raise
+        
+        # Step 4: Propagate to get the new/refined mask
+        log.info(f"[ADD_MASK] Step 4: Propagating after point prompts to get new mask...")
+        outputs0 = None
+        for resp in predictor.handle_stream_request(
+            request=dict(type="propagate_in_video", session_id=session_id)
+        ):
+            if resp.get("frame_index") == 0:
+                outputs0 = resp.get("outputs")
+                break
+        
+        if outputs0 is None:
+            raise RuntimeError("SAM3 propagate_in_video did not return frame 0 outputs")
+        
+        log.info(f"[ADD_MASK] Got outputs, type: {type(outputs0)}")
+        
+        # Format and extract instances
+        formatted0 = prepare_masks_for_visualization({0: outputs0})[0]
+        inst_list = extract_instances_from_formatted(formatted0)
+        log.info(f"[ADD_MASK] Extracted {len(inst_list)} instances from output")
+        
+        if len(inst_list) == 0:
+            raise RuntimeError("No masks found from point prompt. Try a different location.")
+        
+        # Find the instance that contains our point
+        best_mask = None
+        best_score = 0.0
+        target_obj_id = points_request.get("obj_id")
+        
+        point_mask = np.zeros((H, W), dtype=bool)
+        point_mask[add_request.point.y, add_request.point.x] = True
+        
+        for inst in inst_list:
+            inst_obj_id = int(inst.get("obj_id", -1))
+            mask_np = np.asarray(inst["mask"])
+            mask_resized = safe_mask_hw(mask_np, H, W)
+            
+            # Prefer the mask with the target obj_id, or one that contains the point
+            if target_obj_id is not None and inst_obj_id == target_obj_id:
+                best_mask = mask_resized
+                log.info(f"[ADD_MASK] Found mask with target obj_id={target_obj_id}")
+                break
+            elif 0 <= add_request.point.y < H and 0 <= add_request.point.x < W:
+                if mask_resized[add_request.point.y, add_request.point.x]:
+                    # Point is inside this mask - use IoU with point as score
+                    iou = compute_iou(mask_resized, point_mask)
+                    if iou > best_score:
+                        best_score = iou
+                        best_mask = mask_resized
+        
+        if best_mask is None:
+            # Fallback: use the largest mask
+            log.warning(f"[ADD_MASK] Point not in target mask, using largest mask as fallback")
+            best_mask_size = 0
+            for inst in inst_list:
+                mask_np = np.asarray(inst["mask"])
+                mask_resized = safe_mask_hw(mask_np, H, W)
+                mask_size = int(mask_resized.sum())
+                if mask_size > best_mask_size:
+                    best_mask_size = mask_size
+                    best_mask = mask_resized
+        
+        new_mask = best_mask
+        # Ensure mask is boolean for indexing
+        if new_mask.dtype != bool:
+            new_mask = (new_mask > 0.5).astype(bool)
+        new_mask_size = int(new_mask.sum())
+        log.info(f"[ADD_MASK] Created new mask with {new_mask_size} pixels")
+        
+        # Close session
+        try:
+            predictor.handle_request(
+                request=dict(type="close_session", session_id=session_id)
+            )
+        except Exception as e:
+            log.warning(f"[ADD_MASK] Error closing session: {e}")
+        
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    
+    # Add the new mask to the existing masks array
+    # IMPORTANT: We keep all masks (including deleted ones) to preserve original indices
+    # Deleted masks are marked with ID <= 0 in assignments, and will be skipped during apply_correction
+    new_mask_index = len(masks)
+    masks.append(new_mask)
+    
+    # Save all masks (including deleted ones) to preserve original indices
+    np.save(masks_file, np.array(masks, dtype=object))
+    log.info(f"[ADD_MASK] Added new mask at index {new_mask_index}. Total masks: {len(masks)} (including {len(deleted_mask_indices)} deleted)")
+    
+    # Update assignments: keep all original assignments, add new mask
+    assignments = id_assignments.copy()
+    
+    # Assign a new ID to the newly added mask (max existing ID + 1)
+    # Only consider non-deleted masks when finding max ID
+    valid_ids = [v for k, v in assignments.items() if k not in deleted_mask_indices and v > 0]
+    max_existing_id = max(valid_ids) if valid_ids else 0
+    new_id = max_existing_id + 1
+    assignments[new_mask_index] = new_id
+    log.info(f"[ADD_MASK] Assigned new mask (index={new_mask_index}) to ID {new_id} (max existing was {max_existing_id})")
+    
+    # Save updated assignments (keeping deleted masks with ID <= 0, adding new mask)
+    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    np.save(assignments_file, assignments)
+    log.info(f"[ADD_MASK] Saved updated assignments to {assignments_file}")
+    
+    # Render preview image with all masks (including new one)
+    frame = cv2.imread(str(frame_path))
+    if frame is None:
+        raise HTTPException(500, f"Could not read frame {frame_idx}")
+    
+    def color_for(i: int):
+        rng = np.random.RandomState(i)
+        return tuple(int(x) for x in rng.randint(50, 255, size=3))
+    
+    # Render all masks (skip deleted ones)
+    for mask_idx, mask in enumerate(masks):
+        # Skip deleted masks in rendering
+        if mask_idx in deleted_mask_indices:
+            continue
+        
+        # Ensure mask is a numpy array (might be list from file)
+        if not isinstance(mask, np.ndarray):
+            log.warning(f"[ADD_MASK] Mask {mask_idx} is not a numpy array (type={type(mask)}), converting...")
+            mask = np.array(mask)
+        
+        # Ensure mask is boolean for indexing
+        if mask.dtype != bool:
+            mask = (mask > 0.5).astype(bool)
+        
+        log.debug(f"[ADD_MASK] Rendering mask {mask_idx}: dtype={mask.dtype}, shape={mask.shape}, size={int(mask.sum())}px")
+        
+        assigned_id = assignments.get(mask_idx, mask_idx + 1)
+        
+        if mask_idx == new_mask_index:
+            # Highlight the new mask in green
+            col = (0, 255, 0)  # Green for new mask
+            overlay = frame.copy()
+            overlay[mask] = col
+            frame = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
+        else:
+            col = color_for(assigned_id)
+            overlay = frame.copy()
+            overlay[mask] = col
+            frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+        
+        # Draw mask center with assigned ID
+        ys, xs = np.where(mask)
+        if len(ys) > 0:
+            cx, cy = int(xs.mean()), int(ys.mean())
+            cv2.putText(frame, str(assigned_id), (cx-10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # Draw the point that created the new mask
+    cv2.circle(frame, (add_request.point.x, add_request.point.y), 5, (0, 255, 0), -1)
+    cv2.circle(frame, (add_request.point.x, add_request.point.y), 8, (255, 255, 255), 2)
+    
+    # Encode preview image
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to encode frame")
+    
+    import base64
+    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    
+    log.info(f"[ADD_MASK] ========== NEW MASK ADDED ==========")
+    log.info(f"[ADD_MASK] New mask size: {new_mask_size}px")
+    log.info(f"[ADD_MASK] Total masks: {len(masks)}")
+    log.info(f"[ADD_MASK] ====================================")
+    
+    # Build mask_assignments array (same format as prepare_correction)
+    # Use existing assignments for old masks, and assign a new ID for the new mask
+    mask_assignments = []
+    for mask_idx in range(len(masks)):
+        assigned_id = assignments.get(mask_idx, mask_idx + 1)
+        mask_assignments.append({
+            "mask_index": mask_idx,
+            "auto_assigned_id": assigned_id,
+        })
+    
+    log.info(f"[ADD_MASK] Built mask_assignments: {len(mask_assignments)} entries")
+    
+    return JSONResponse(content={
+        "image": f"data:image/jpeg;base64,{image_b64}",
+        "new_mask_index": len(masks) - 1,
+        "new_mask_size": new_mask_size,
+        "total_masks": len(masks),
+        "mask_assignments": mask_assignments,
+        "image_width": int(W),
+        "image_height": int(H),
+    })
 
 @app.post("/refine_mask/{run_id}/{frame_idx}")
 def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     """
-    Refine a mask using point prompts.
-    Takes a mask_index and list of points (positive/negative) and uses SAM-3 point prompts to refine the mask.
+    Refine a mask using point prompts with SAM-3 video predictor (1-frame video session).
+    This follows the same approach as testing_backend.py: create a 1-frame video session,
+    establish the mask as an object, then add point prompts to refine it.
     """
     import numpy as np
     import cv2
+    import tempfile
+    import shutil
     from PIL import Image
     from fastapi.responses import JSONResponse
+    from sam3.visualization_utils import prepare_masks_for_visualization
     
+    log.info(f"[REFINE_MASK] ========== START REFINEMENT ==========")
     log.info(f"/refine_mask run_id={run_id} frame_idx={frame_idx} mask_index={refine_request.mask_index} points={len(refine_request.points)}")
     
     run_dir = RUNS_ROOT / run_id
@@ -2843,7 +3878,18 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     if not masks_file.exists():
         raise HTTPException(400, f"Masks not found. Please run prepare_correction first.")
     
-    masks = np.load(masks_file, allow_pickle=True)
+    loaded_masks = np.load(masks_file, allow_pickle=True)
+    # Ensure all loaded masks are numpy arrays and boolean
+    masks = []
+    for i, m in enumerate(loaded_masks):
+        if not isinstance(m, np.ndarray):
+            log.warning(f"[REFINE_MASK] Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
+            m = np.asarray(m)
+        if m.dtype != bool:
+            log.warning(f"[REFINE_MASK] Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
+            m = (m > 0.5).astype(bool)
+        masks.append(m)
+    log.info(f"[REFINE_MASK] Loaded {len(masks)} masks from {masks_file}")
     if refine_request.mask_index >= len(masks):
         raise HTTPException(400, f"Invalid mask_index {refine_request.mask_index} (max: {len(masks)-1})")
     
@@ -2857,110 +3903,369 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     if not frame_path.exists():
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
-    # Get the mask to refine
-    original_mask = masks[refine_request.mask_index]
+    # Get the mask to refine (this might already be refined from a previous call)
+    current_mask = masks[refine_request.mask_index]
+    original_mask_size = int(current_mask.sum())
+    log.info(f"[REFINE_MASK] Current mask {refine_request.mask_index} state:")
+    log.info(f"  - Size: {original_mask_size} pixels")
+    log.info(f"  - Shape: {current_mask.shape}")
+    log.info(f"  - Dtype: {current_mask.dtype}")
+    log.info(f"  - Min/Max: {current_mask.min()}/{current_mask.max()}")
     
     # Prepare point prompts for SAM-3
-    # SAM-3 expects points as numpy array with shape (N, 2) and labels as (N,) where 1=positive, 0=negative
-    points_array = np.array([[p.x, p.y] for p in refine_request.points])
-    labels_array = np.array([1 if p.is_positive else 0 for p in refine_request.points])
-    
-    log.info(f"[REFINE_MASK] Refining mask {refine_request.mask_index} with {len(refine_request.points)} points ({sum(labels_array)} positive, {len(labels_array)-sum(labels_array)} negative)")
-    
-    # Run SAM-3 with mask input + point prompts to refine the specific mask
-    # This ensures we only refine the selected mask, not trigger a full detection
-    processor = get_model()
+    # Convert absolute pixel coords to relative [0,1] coords
     img = Image.open(frame_path).convert("RGB")
     W, H = img.size
     
-    state = processor.set_image(img)
+    log.info(f"[REFINE_MASK] Refining mask {refine_request.mask_index} with {len(refine_request.points)} points (current size: {original_mask_size} pixels)")
     
-    # Convert original mask to tensor format for SAM-3
-    # Resize mask to match SAM-3's expected input size
-    import torch
-    mask_tensor = torch.from_numpy(original_mask.astype(np.float32))
-    # SAM-3 might expect mask in a specific format - try different approaches
-    mask_input = mask_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+    # Track if object was removed (needs to be accessible after try block)
+    object_removed = False
     
-    # Workaround: Since SAM-3 doesn't support mask+point refinement directly,
-    # we use point prompts alone, then match the result back to the original mask
-    # This prevents ID permutation while still allowing refinement
-    refined_mask = original_mask  # Default to original mask
-    out = None
+    # Use video predictor with 1-frame video session (exactly like testing_backend.py)
+    predictor = get_video_predictor()
     
-    # First, try to find a method that accepts point prompts
-    # Inspect processor to see what methods are available
-    processor_methods = [m for m in dir(processor) if not m.startswith('_') and callable(getattr(processor, m))]
-    log.info(f"[REFINE_MASK] Available processor methods: {processor_methods}")
-    
+    # Create temporary 1-frame video folder (exactly like testing_backend.py start_single_image_session)
+    tmpdir = tempfile.mkdtemp(prefix="sam3_refine_")
     try:
-        # Try different possible methods for point prompts
-        if hasattr(processor, 'set_point_prompt'):
-            # Try point prompt method
-            out = processor.set_point_prompt(state=state, points=points_array, labels=labels_array)
-            log.info("[REFINE_MASK] Used set_point_prompt method")
-        elif hasattr(processor, 'predict'):
-            # Try standard SAM predict with points (no mask input)
-            try:
-                out = processor.predict(
-                    state=state,
-                    point_coords=points_array,
-                    point_labels=labels_array,
-                    multimask_output=True,  # Get multiple candidates to match
-                )
-                log.info("[REFINE_MASK] Used predict method with points")
-            except TypeError:
-                # Try without multimask_output parameter
-                out = processor.predict(
-                    state=state,
-                    point_coords=points_array,
-                    point_labels=labels_array,
-                )
-                log.info("[REFINE_MASK] Used predict method with points (no multimask_output)")
-        else:
-            log.warning("[REFINE_MASK] No point prompt method found, trying to use text prompt as fallback")
-            # Last resort: use text prompt (won't refine, but at least won't crash)
-            out = None
-    except Exception as e:
-        log.error(f"[REFINE_MASK] Error calling point prompt method: {e}", exc_info=True)
-        out = None
-    
-    # Extract masks from output and match to original mask
-    if out is not None and "masks" in out and len(out["masks"]) > 0:
-        # Get all candidate masks from SAM
-        candidate_masks = []
-        for m in out["masks"]:
-            mask_tensor = m.squeeze().cpu().numpy()
-            mask = np.array(Image.fromarray(mask_tensor).resize((W, H), Image.NEAREST)) > MASK_THRESHOLD
-            if mask.sum() > 100:  # Filter out tiny masks
-                candidate_masks.append(mask)
+        # Load image and save as JPEG (exactly like testing_backend.py start_single_image_session)
+        import cv2
+        img = Image.open(frame_path).convert("RGB")
+        image_np = np.array(img)
+        frame_tmp_path = Path(tmpdir) / "00000.jpg"
+        # Save as JPEG like the notebook expects for folders (exactly like testing_backend.py)
+        bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        ok = cv2.imwrite(str(frame_tmp_path), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError("Failed to write temporary frame for SAM3 session")
         
-        if candidate_masks:
-            # Match each candidate to the original mask using IoU
-            best_mask = None
-            best_iou = 0.0
-            for candidate in candidate_masks:
-                iou = compute_iou(candidate, original_mask)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_mask = candidate
+        # Start session (exactly like testing_backend.py)
+        resp = predictor.handle_request(
+            request=dict(
+                type="start_session",
+                resource_path=str(tmpdir),
+            )
+        )
+        session_id = resp["session_id"]
+        log.info(f"[REFINE_MASK] Started session {session_id}")
+        
+        # Add TEXT prompt on frame 0 (exactly like testing_backend.py /segment/init)
+        # IMPORTANT: Create a completely fresh dict with ONLY text, no points variables in scope
+        log.info(f"[REFINE_MASK] Step 1: Adding text prompt '{prompt}' to establish objects")
+        text_request_dict = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": prompt,
+        }
+        log.info(f"[REFINE_MASK] Text request: keys={list(text_request_dict.keys())}, has 'points': {'points' in text_request_dict}, has 'obj_id': {'obj_id' in text_request_dict}")
+        
+        # Retry logic for BFloat16 errors (SAM-3 internal issue)
+        max_retries = 2
+        for retry in range(max_retries):
+            try:
+                _ = predictor.handle_request(request=text_request_dict)
+                log.info(f"[REFINE_MASK] Text prompt added successfully")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                log.error(f"[REFINE_MASK] Error adding text prompt (attempt {retry+1}/{max_retries}): {error_msg}")
+                log.error(f"[REFINE_MASK] Error type: {type(e).__name__}")
+                
+                if "BFloat16" in error_msg or "bias type" in error_msg:
+                    log.error("[REFINE_MASK] BFloat16 dtype error detected - this is a SAM-3 model state issue")
+                    if retry < max_retries - 1:
+                        log.warning("[REFINE_MASK] Reinitializing predictor and retrying...")
+                        # Close current session before reinitializing
+                        try:
+                            predictor.handle_request(request=dict(type="close_session", session_id=session_id))
+                        except:
+                            pass
+                        # Reinitialize predictor
+                        predictor = get_video_predictor(force_reinit=True)
+                        # Restart session
+                        resp = predictor.handle_request(
+                            request=dict(
+                                type="start_session",
+                                resource_path=str(tmpdir),
+                            )
+                        )
+                        session_id = resp["session_id"]
+                        log.info(f"[REFINE_MASK] Restarted session {session_id} after reinit")
+                        # Update text_request_dict with new session_id
+                        text_request_dict["session_id"] = session_id
+                        continue
+                    else:
+                        raise RuntimeError("SAM-3 model dtype error (BFloat16/bias mismatch) persisted after retries. Please try again later.") from e
+                raise
+        
+        # NOW prepare points (after text prompt is done, to avoid any scope issues)
+        points_xy = np.array([[p.x, p.y] for p in refine_request.points], dtype=np.float32)
+        # SAM3 convention: positive=1, negative=0
+        labels = np.array([1 if p.is_positive else 0 for p in refine_request.points], dtype=np.int32)
+        
+        # WORKAROUND: SAM-3 quirk with single point prompts (both positive and negative)
+        # Empirically discovered: single points (especially negative) cause incorrect behavior.
+        # Duplicating the exact same point (providing no new information) fixes this behavior.
+        # This suggests a technical quirk in SAM-3's point processing (possibly tensor shape
+        # requirements or internal logic that expects multiple points) rather than a semantic issue.
+        # Without duplication: single negative point → mask grows (+2%)
+        # With duplication: same point duplicated → mask shrinks correctly (-10.9%)
+        # We apply this workaround to ALL single points (positive and negative) to ensure consistent behavior.
+        if len(points_xy) == 1:
+            log.info(f"[REFINE_MASK] WORKAROUND: Duplicating single point (label={labels[0]}) to work around SAM-3 quirk")
+            points_xy = np.vstack([points_xy, points_xy])  # Duplicate the point
+            labels = np.append(labels, labels[0])  # Duplicate the label (preserve positive/negative)
+            log.info(f"[REFINE_MASK] Duplicated point: now have 2 points at ({points_xy[0, 0]:.1f}, {points_xy[0, 1]:.1f}) with label={labels[0]}")
+        
+        # Convert to relative coordinates
+        points_rel = points_xy.copy()
+        points_rel[:, 0] /= float(W)
+        points_rel[:, 1] /= float(H)
+        
+        log.info(f"[REFINE_MASK] Prepared {len(points_xy)} points ({sum(labels)} positive, {len(labels)-sum(labels)} negative)")
+        # Log point details for debugging (use points_xy after potential duplication)
+        for i in range(len(points_xy)):
+            label = labels[i]
+            point_type = "positive" if label == 1 else "negative"
+            px, py = int(points_xy[i, 0]), int(points_xy[i, 1])
+            log.info(f"[REFINE_MASK] Point {i+1}: ({px}, {py}) - {point_type} (label={label})")
+            # Check if point is inside current mask
+            if 0 <= py < H and 0 <= px < W:
+                is_inside = current_mask[py, px] if current_mask.dtype == bool else (current_mask[py, px] > 0.5)
+                log.info(f"[REFINE_MASK] Point {i+1} is {'INSIDE' if is_inside else 'OUTSIDE'} current mask")
+        
+        # Propagate to get initial mask (exactly like testing_backend.py propagate_frame0)
+        log.info(f"[REFINE_MASK] Step 2: Propagating after text prompt to get initial masks...")
+        outputs0 = None
+        for resp in predictor.handle_stream_request(
+            request=dict(type="propagate_in_video", session_id=session_id)
+        ):
+            if resp.get("frame_index") == 0:
+                outputs0 = resp.get("outputs")
+                break
+        
+        if outputs0 is None:
+            raise RuntimeError("SAM3 propagate_in_video did not return frame 0 outputs")
+        log.info(f"[REFINE_MASK] Got initial outputs from text prompt, type: {type(outputs0)}")
+        if isinstance(outputs0, dict):
+            log.info(f"[REFINE_MASK] Initial outputs keys: {list(outputs0.keys())[:20]}")
+        
+        # Format and extract instances (exactly like testing_backend.py format_frame0 + extract_instances_from_formatted)
+        log.info(f"[REFINE_MASK] Step 3: Formatting and extracting instances from text prompt output...")
+        formatted0 = prepare_masks_for_visualization({0: outputs0})[0]
+        inst_list = extract_instances_from_formatted(formatted0)
+        log.info(f"[REFINE_MASK] Extracted {len(inst_list)} instances from formatted output")
+        
+        # Find the obj_id that matches our original mask by IoU
+        log.info(f"[REFINE_MASK] Matching current mask (size={original_mask_size}px) to text prompt instances...")
+        obj_id = None
+        best_iou = 0.0
+        matched_mask_size = None
+        
+        for inst in inst_list:
+            mask_np = np.asarray(inst["mask"])
+            # Use safe_mask_hw to ensure correct size (exactly like testing_backend.py)
+            mask_resized = safe_mask_hw(mask_np, H, W)
+            inst_mask_size = int(mask_resized.sum())
+            inst_obj_id = int(inst["obj_id"])
+
+            # Compute IoU with current mask (which might already be refined)
+            iou = compute_iou(mask_resized, current_mask)
+            log.info(f"[REFINE_MASK]   - Instance obj_id={inst_obj_id}: size={inst_mask_size}px, IoU={iou:.3f}")
             
-            if best_mask is not None and best_iou > 0.1:  # Require at least 10% overlap
-                refined_mask = best_mask
-                log.info(f"[REFINE_MASK] Matched refined mask: IoU={best_iou:.3f}, original size={int(original_mask.sum())}, refined size={int(refined_mask.sum())}")
+            if iou > best_iou:
+                best_iou = iou
+                obj_id = int(inst["obj_id"])
+                matched_mask_size = inst_mask_size
+        
+        # If IoU is too low, try using point location as fallback (especially for very small masks)
+        if obj_id is None or best_iou < 0.1:
+            log.warning(f"[REFINE_MASK] IoU too low ({best_iou:.3f}), trying point-based fallback matching...")
+            
+            # Check which instance contains the most points
+            point_matches = {}
+            for inst in inst_list:
+                mask_np = np.asarray(inst["mask"])
+                mask_resized = safe_mask_hw(mask_np, H, W)
+                inst_obj_id = int(inst.get("obj_id", -1))
+                
+                # Count how many points are inside this mask
+                points_inside = 0
+                for p in refine_request.points:
+                    if 0 <= p.y < H and 0 <= p.x < W:
+                        if mask_resized[p.y, p.x]:
+                            points_inside += 1
+                
+                if points_inside > 0:
+                    point_matches[inst_obj_id] = points_inside
+            
+            if point_matches:
+                # Use the instance with the most points inside
+                best_obj_id = max(point_matches.items(), key=lambda x: x[1])[0]
+                log.info(f"[REFINE_MASK] Point-based fallback: obj_id={best_obj_id} contains {point_matches[best_obj_id]} point(s)")
+                obj_id = best_obj_id
+                
+                # Find the matched mask size
+                for inst in inst_list:
+                    if int(inst.get("obj_id", -1)) == obj_id:
+                        mask_np = np.asarray(inst["mask"])
+                        mask_resized = safe_mask_hw(mask_np, H, W)
+                        matched_mask_size = int(mask_resized.sum())
+                        break
             else:
-                log.warning(f"[REFINE_MASK] Best match IoU too low ({best_iou:.3f}), using original mask")
+                # Last resort: use the instance with highest IoU even if < 0.1
+                if obj_id is not None:
+                    log.warning(f"[REFINE_MASK] No points in any mask, using best IoU match (obj_id={obj_id}, IoU={best_iou:.3f})")
+                else:
+                    raise RuntimeError(f"Could not find matching obj_id for mask {refine_request.mask_index} (best IoU: {best_iou:.3f}, no points in any mask)")
+        
+        log.info(f"[REFINE_MASK] Step 3: Matching complete")
+        log.info(f"  - Matched current mask (size={original_mask_size}px) to obj_id={obj_id} (IoU={best_iou:.3f})")
+        if matched_mask_size is not None:
+            size_diff = matched_mask_size - original_mask_size
+            size_diff_pct = (size_diff/original_mask_size*100) if original_mask_size > 0 else 0
+            log.info(f"  - Text prompt mask size: {matched_mask_size}px")
+            log.info(f"  - Size difference: {size_diff:+d}px ({size_diff_pct:+.1f}%)")
+            if abs(size_diff) > original_mask_size * 0.05:  # More than 5% difference
+                log.warning(f"[REFINE_MASK] ⚠️  WARNING: Text prompt mask differs significantly from current mask! This might cause refinement issues.")
+            else:
+                log.info(f"  - ✓ Text prompt mask matches current mask well (within 5%)")
+        
+        # Now add point prompts to refine this object (exactly like testing_backend.py /segment/refine)
+        import torch
+        points_tensor = torch.tensor(points_rel, dtype=torch.float32)
+        labels_tensor = torch.tensor(labels, dtype=torch.int32)
+        
+        # Ensure obj_id is valid (exactly like testing_backend.py)
+        if obj_id is None:
+            raise RuntimeError(f"obj_id is None after matching - cannot refine mask {refine_request.mask_index}")
+        
+        log.info(f"[REFINE_MASK] Step 4: Adding point prompts to refine obj_id={obj_id}")
+        log.info(f"  - Number of points: {len(points_rel)}")
+        log.info(f"  - Points tensor: shape={points_tensor.shape}, dtype={points_tensor.dtype}")
+        log.info(f"  - Labels tensor: shape={labels_tensor.shape}, dtype={labels_tensor.dtype}, values={labels_tensor.tolist()}")
+        log.info(f"  - Positive points: {int(labels_tensor.sum())}, Negative points: {len(labels_tensor) - int(labels_tensor.sum())}")
+        
+        # Make sure we explicitly pass obj_id as int (exactly like testing_backend.py)
+        points_request = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "points": points_tensor,
+            "point_labels": labels_tensor,
+            "obj_id": int(obj_id),
+        }
+        log.info(f"[REFINE_MASK] Points request: keys={list(points_request.keys())}, obj_id={points_request.get('obj_id')} (type: {type(points_request.get('obj_id'))})")
+        log.info(f"[REFINE_MASK] Calling predictor.handle_request with point prompts...")
+        _ = predictor.handle_request(request=points_request)
+        log.info(f"[REFINE_MASK] ✓ Point prompts added successfully to SAM-3")
+        
+        # Propagate again to get refined mask (exactly like testing_backend.py propagate_frame0)
+        log.info(f"[REFINE_MASK] Step 5: Propagating after point prompts to get refined mask...")
+        log.info(f"  - Expecting refined output for obj_id={obj_id}")
+        outputs0_refined = None
+        for resp in predictor.handle_stream_request(
+            request=dict(type="propagate_in_video", session_id=session_id)
+        ):
+            if resp.get("frame_index") == 0:
+                outputs0_refined = resp.get("outputs")
+                log.info(f"[REFINE_MASK] Got refined outputs for frame 0, type: {type(outputs0_refined)}")
+                if isinstance(outputs0_refined, dict):
+                    log.info(f"[REFINE_MASK] Refined outputs keys: {list(outputs0_refined.keys())[:20]}")
+                break
+        
+        if outputs0_refined is None:
+            raise RuntimeError("SAM3 propagate_in_video did not return refined frame 0 outputs")
+        
+        # Format and extract instances (exactly like testing_backend.py)
+        log.info(f"[REFINE_MASK] Step 6: Formatting and extracting refined instances...")
+        formatted0_refined = prepare_masks_for_visualization({0: outputs0_refined})[0]
+        inst_list_refined = extract_instances_from_formatted(formatted0_refined)
+        log.info(f"[REFINE_MASK] Extracted {len(inst_list_refined)} instances from refined output")
+        log.info(f"[REFINE_MASK] Available obj_ids in refined output: {[int(inst.get('obj_id', -1)) for inst in inst_list_refined]}")
+
+        # Find the mask for our obj_id (exactly like testing_backend.py /segment/refine)
+        found = None
+        for inst in inst_list_refined:
+            inst_obj_id = int(inst.get("obj_id", -1))
+            inst_mask_size = int(np.asarray(inst.get("mask", np.array([]))).sum()) if inst.get("mask") is not None else 0
+            log.info(f"[REFINE_MASK]   - Instance obj_id={inst_obj_id}, mask_size={inst_mask_size}px")
+            if inst_obj_id == int(obj_id):
+                found = inst
+                log.info(f"[REFINE_MASK] ✓ Found matching instance with obj_id={inst_obj_id}, mask_size={inst_mask_size}px")
+                break
+
+        if found is None:
+            # Object disappeared - likely removed by negative points
+            log.warning(f"[REFINE_MASK] ⚠️  obj_id={obj_id} disappeared from refined output (likely removed by negative points)")
+            log.warning(f"[REFINE_MASK] Available obj_ids: {[int(inst.get('obj_id', -1)) for inst in inst_list_refined]}")
+            
+            # Object was completely removed - keep original mask unchanged
+            log.warning(f"[REFINE_MASK] Object was completely removed by refinement. Keeping original mask unchanged.")
+            object_removed = True
+            
+            # Use the original mask (don't update it)
+            refined_mask = current_mask.copy()
+            refined_mask_size = original_mask_size
+            size_change = 0
+            size_change_pct = 0.0
+            
+            log.info(f"[REFINE_MASK] ========== REFINEMENT RESULT (OBJECT REMOVED) ==========")
+            log.info(f"[REFINE_MASK] Original mask size: {original_mask_size}px")
+            log.info(f"[REFINE_MASK] Refined mask size: {refined_mask_size}px (unchanged)")
+            log.info(f"[REFINE_MASK] Size change: {size_change:+d}px ({size_change_pct:+.1f}%)")
+            log.info(f"[REFINE_MASK] ⚠️  Object was removed by negative points. Mask preserved.")
+            log.info(f"[REFINE_MASK] ======================================")
         else:
-            log.warning("[REFINE_MASK] No valid candidate masks from SAM output")
-    else:
-        if out is None:
-            log.warning("[REFINE_MASK] Point prompt method not available, using original mask")
-        else:
-            log.warning("[REFINE_MASK] No masks in output, using original mask")
+            # Get refined mask (exactly like testing_backend.py - uses safe_mask_hw)
+            log.info(f"[REFINE_MASK] Step 7: Extracting refined mask...")
+            mask = safe_mask_hw(np.asarray(found["mask"]), H, W)
+            refined_mask = mask
+            refined_mask_size = int(refined_mask.sum())
+            size_change = refined_mask_size - original_mask_size
+            size_change_pct = (size_change / original_mask_size * 100) if original_mask_size > 0 else 0
+
+            log.info(f"[REFINE_MASK] ========== REFINEMENT RESULT ==========")
+            log.info(f"[REFINE_MASK] Original mask size: {original_mask_size}px")
+            log.info(f"[REFINE_MASK] Refined mask size: {refined_mask_size}px")
+            log.info(f"[REFINE_MASK] Size change: {size_change:+d}px ({size_change_pct:+.1f}%)")
+            if len(refine_request.points) == 1 and labels[0] == 0 and size_change > 0:
+                log.warning(f"[REFINE_MASK] ⚠️  WARNING: Single negative point caused mask to GROW (expected to shrink)!")
+            elif len(refine_request.points) == 1 and labels[0] == 0 and size_change < 0:
+                log.info(f"[REFINE_MASK] ✓ Single negative point correctly shrunk the mask")
+            log.info(f"[REFINE_MASK] ======================================")
+        
+        # Close session
+        try:
+            predictor.handle_request(
+                request=dict(type="close_session", session_id=session_id)
+            )
+        except Exception as e:
+            log.warning(f"[REFINE_MASK] Error closing session: {e}")
+        
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(tmpdir, ignore_errors=True)
     
-    # Update the mask in the masks array
-    masks[refine_request.mask_index] = refined_mask
-    np.save(masks_file, masks)  # Save updated masks
+    # Reload original masks to ensure we don't accidentally modify other masks
+    # This ensures we only update the specific mask being refined
+    original_loaded_masks = np.load(masks_file, allow_pickle=True)
+    original_masks = []
+    for i, m in enumerate(original_loaded_masks):
+        if not isinstance(m, np.ndarray):
+            m = np.asarray(m)
+        if m.dtype != bool:
+            m = (m > 0.5).astype(bool)
+        original_masks.append(m)
+    
+    # Only update the specific mask being refined - preserve all others exactly as they were
+    original_masks[refine_request.mask_index] = refined_mask
+    
+    # Save updated masks (only the refined mask changed, all others are preserved)
+    np.save(masks_file, np.array(original_masks, dtype=object))
+    log.info(f"[REFINE_MASK] Updated only mask {refine_request.mask_index}, preserved all other masks unchanged")
     
     # Load ID assignments from prepare_correction to preserve IDs
     assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
@@ -2982,8 +4287,25 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
         return tuple(int(x) for x in rng.randint(50, 255, size=3))
     
     # Render all masks (with refined one) using preserved ID assignments
-    for mask_idx, mask in enumerate(masks):
-        assigned_id = assignments.get(mask_idx, mask_idx + 1)  # Use preserved ID
+    # Skip deleted masks (ID <= 0 or missing from assignments) - only render active masks
+    for mask_idx, mask in enumerate(original_masks):
+        # Check if mask is deleted before processing
+        # A mask is deleted if: 1) it's missing from assignments, or 2) its assigned_id <= 0
+        if mask_idx not in assignments:
+            # Mask is missing from assignments - it was deleted
+            continue
+        assigned_id = assignments[mask_idx]
+        if assigned_id <= 0:
+            # Skip deleted masks (ID <= 0)
+            continue
+        
+        # Ensure mask is boolean for indexing
+        if not isinstance(mask, np.ndarray):
+            log.warning(f"[REFINE_MASK] Mask {mask_idx} is not a numpy array (type: {type(mask)}), converting for rendering.")
+            mask = np.asarray(mask)
+        if mask.dtype != bool:
+            log.warning(f"[REFINE_MASK] Mask {mask_idx} is not boolean (dtype: {mask.dtype}), converting for rendering.")
+            mask = (mask > 0.5).astype(bool)
         
         if mask_idx == refine_request.mask_index:
             # Highlight the refined mask
@@ -3022,13 +4344,19 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     # Get image dimensions for coordinate validation
     img_height, img_width = frame.shape[:2]
     
-    return JSONResponse(content={
+    response_content = {
         "image": f"data:image/jpeg;base64,{image_b64}",
         "mask_index": refine_request.mask_index,
         "refined_mask_size": int(refined_mask.sum()),
         "image_width": int(img_width),
         "image_height": int(img_height),
-    })
+    }
+    
+    # Add warning if object was removed
+    if object_removed:
+        response_content["warning"] = "Object was removed by negative points. Mask unchanged. Try adding positive points to restore it."
+    
+    return JSONResponse(content=response_content)
 
 @app.post("/preview_correction_update/{run_id}/{frame_idx}")
 def preview_correction_update(run_id: str, frame_idx: int, preview_update: PreviewUpdate):
@@ -3060,8 +4388,27 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
     if not frame_path.exists():
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
-    new_masks = run_sam3_on_frame(prompt, frame_path)
-    log.info(f"Got {len(new_masks)} masks from SAM-3")
+    # Load refined masks if they exist (from refine_mask/add_mask), otherwise run SAM-3 from scratch
+    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    if masks_file.exists():
+        log.info(f"[PREVIEW_CORRECTION_UPDATE] Loading refined masks from {masks_file}")
+        loaded_masks = np.load(masks_file, allow_pickle=True)
+        # Ensure all loaded masks are numpy arrays and boolean
+        new_masks = []
+        for i, m in enumerate(loaded_masks):
+            if not isinstance(m, np.ndarray):
+                log.warning(f"[PREVIEW_CORRECTION_UPDATE] Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
+                m = np.asarray(m)
+            if m.dtype != bool:
+                log.warning(f"[PREVIEW_CORRECTION_UPDATE] Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
+                m = (m > 0.5).astype(bool)
+            new_masks.append(m)
+        log.info(f"[PREVIEW_CORRECTION_UPDATE] Loaded {len(new_masks)} refined masks")
+    else:
+        # Fall back to running SAM-3 from scratch if no refined masks exist
+        log.info(f"[PREVIEW_CORRECTION_UPDATE] No refined masks found, running SAM-3 from scratch")
+        new_masks = run_sam3_on_frame(prompt, frame_path)
+        log.info(f"[PREVIEW_CORRECTION_UPDATE] Got {len(new_masks)} masks from SAM-3")
     
     # Load frame (make a copy so we don't modify the original)
     frame = cv2.imread(str(frame_path))
@@ -3117,6 +4464,14 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
     
     log.info(f"Rendered {rendered_count} masks in preview")
     
+    # Save assignments file to preserve deletions (ID <= 0) for add_mask to use
+    # Convert string keys to int keys for consistency
+    assignments = {int(k): int(v) for k, v in preview_update.mapping.items()}
+    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    np.save(assignments_file, assignments)
+    deleted_count = sum(1 for v in assignments.values() if v <= 0)
+    log.info(f"[PREVIEW_CORRECTION_UPDATE] Saved assignments to {assignments_file} (including {deleted_count} deleted masks)")
+    
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
         raise HTTPException(status_code=500, detail="failed to encode frame")
@@ -3147,28 +4502,56 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
     meta = parse_meta_file(meta_path)
     prompt = meta.get("prompt", "object")
     
-    # Get frame and run SAM again (or we could cache it, but simpler to rerun)
+    # Get frame path (needed for later operations)
     src_root = run_dir / "xmem_generic"
     jpeg_dir = src_root / "JPEGImages" / VIDEO_NAME
     frame_path = jpeg_dir / f"{frame_idx:05d}.jpg"
     
+    log.info(f"[APPLY_CORRECTION] Frame path: {frame_path} (exists: {frame_path.exists()})")
+    
     if not frame_path.exists():
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
-    new_masks = run_sam3_on_frame(prompt, frame_path)
+    # Check if refined masks exist (from point-based refinement)
+    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    log.info(f"[APPLY_CORRECTION] Checking for refined masks: {masks_file} (exists: {masks_file.exists()})")
+    
+    if masks_file.exists():
+        log.info(f"[APPLY_CORRECTION] Using refined masks from {masks_file}")
+        loaded_masks = np.load(masks_file, allow_pickle=True)
+        # Ensure all loaded masks are numpy arrays and boolean
+        new_masks = []
+        for i, m in enumerate(loaded_masks):
+            if not isinstance(m, np.ndarray):
+                log.warning(f"[APPLY_CORRECTION] Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
+                m = np.asarray(m)
+            if m.dtype != bool:
+                log.warning(f"[APPLY_CORRECTION] Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
+                m = (m > 0.5).astype(bool)
+            new_masks.append(m)
+        log.info(f"[APPLY_CORRECTION] Loaded {len(new_masks)} refined masks")
+    else:
+        # Fall back to running SAM-3 from scratch if no refined masks exist
+        log.info(f"[APPLY_CORRECTION] No refined masks found, running SAM-3 from scratch")
+        new_masks = run_sam3_on_frame(prompt, frame_path)
+        log.info(f"[APPLY_CORRECTION] SAM-3 returned {len(new_masks)} masks")
     
     # Apply user's ID mapping
+    log.info(f"[APPLY_CORRECTION] Applying ID mapping: {id_mapping.mapping}")
     H, W = new_masks[0].shape
+    log.info(f"[APPLY_CORRECTION] Mask dimensions: H={H}, W={W}, num_masks={len(new_masks)}")
     label_map = np.zeros((H, W), dtype=np.uint8)
     
     for mask_idx_str, final_id in id_mapping.mapping.items():
         mask_idx = int(mask_idx_str)
         if mask_idx >= len(new_masks):
-            raise HTTPException(400, f"Invalid mask_index {mask_idx}")
+            raise HTTPException(400, f"Invalid mask_index {mask_idx} (max: {len(new_masks)-1})")
         final_id = int(final_id)
         if final_id <= 0:  # Skip deleted masks (0 or negative)
+            log.info(f"[APPLY_CORRECTION] Skipping mask {mask_idx} (deleted, final_id={final_id})")
             continue
         label_map[new_masks[mask_idx]] = final_id
+        log.info(f"[APPLY_CORRECTION] Assigned mask {mask_idx} -> ID {final_id}")
     
     # NOTE: We do NOT renumber IDs during corrections. The user (or auto-assignment) has
     # explicitly chosen which IDs to use, and these IDs are meant to match existing IDs
@@ -3196,12 +4579,17 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
     log.info(f"Saved corrected annotation to {corrected_ann_path}")
     
     # Also copy JPEG frame
+    log.info(f"[APPLY_CORRECTION] Copying JPEG frame, jpeg_dir={jpeg_dir}")
     golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
     ensure_dir(golden_jpeg_dir)
     src_jpeg_frame = jpeg_dir / f"{frame_idx:05d}.jpg"
+    log.info(f"[APPLY_CORRECTION] Source JPEG: {src_jpeg_frame} (exists: {src_jpeg_frame.exists()})")
     if src_jpeg_frame.exists():
         dst_jpeg_frame = golden_jpeg_dir / f"{frame_idx:05d}.jpg"
         shutil.copy2(src_jpeg_frame, dst_jpeg_frame)
+        log.info(f"[APPLY_CORRECTION] Copied JPEG frame to {dst_jpeg_frame}")
+    else:
+        log.warning(f"[APPLY_CORRECTION] Source JPEG frame not found: {src_jpeg_frame}")
     
     new_max_id = int(label_map.max())
     unique_ids = sorted(list(set(label_map.flatten())))
@@ -3503,7 +4891,11 @@ def result(run_id: str):
     path = RUNS_ROOT / run_id / "tracked.mp4"
     if not path.exists():
         raise HTTPException(404, "No result yet. Run /track first.")
-    return FileResponse(path, media_type="video/mp4")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        headers={"Cache-Control": "no-store, max-age=0", "Accept-Ranges": "bytes"},
+    )
 
 
 @app.get("/golden_video/{run_id}")
@@ -3553,3 +4945,76 @@ def paths(run_id: str):
         "golden_preview_video": str(golden_video.resolve()) if golden_video.exists() else None,
         "golden_jpeg_images": str(golden_jpeg.resolve()) if golden_jpeg.exists() else None,
     }
+
+
+@app.get("/download_golden/{run_id}")
+def download_golden(run_id: str, background_tasks: BackgroundTasks):
+    """
+    Download the golden folder as a zip file.
+    """
+    import tempfile
+    import zipfile
+    from fastapi.responses import FileResponse
+    
+    log.info(f"/download_golden run_id={run_id}")
+    
+    run_dir = RUNS_ROOT / run_id
+    meta_path = run_dir / "meta.txt"
+    if not meta_path.exists():
+        raise HTTPException(404, "run_id not found")
+    
+    golden_root = run_dir / "golden"
+    if not golden_root.exists():
+        raise HTTPException(404, f"Golden folder not found for run_id: {run_id}")
+    
+    # Create a temporary zip file in scratch space (not /tmp which may be full)
+    scratch_tmp = Path("/scratch/project_2016918/tmp")
+    scratch_tmp.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=str(scratch_tmp)) as tmp_zip:
+        zip_path = Path(tmp_zip.name)
+    
+    try:
+        # Create zip file with golden folder contents
+        log.info(f"[DOWNLOAD_GOLDEN] Creating zip file: {zip_path}")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Walk through the golden folder and add all files
+            for file_path in golden_root.rglob('*'):
+                if file_path.is_file():
+                    # Get relative path from golden_root
+                    arcname = file_path.relative_to(golden_root)
+                    zipf.write(file_path, arcname)
+                    log.debug(f"[DOWNLOAD_GOLDEN] Added to zip: {arcname}")
+        
+        log.info(f"[DOWNLOAD_GOLDEN] Zip file created: {zip_path} ({zip_path.stat().st_size} bytes)")
+        
+        # Return the zip file as a download
+        # Clean up the temp file after download
+        def cleanup_zip():
+            if zip_path.exists():
+                try:
+                    zip_path.unlink()
+                    log.info(f"[DOWNLOAD_GOLDEN] Cleaned up temp zip file: {zip_path}")
+                except Exception as e:
+                    log.warning(f"[DOWNLOAD_GOLDEN] Failed to clean up zip file: {e}")
+        
+        background_tasks.add_task(cleanup_zip)
+        
+        return FileResponse(
+            path=str(zip_path),
+            filename=f"{run_id}_golden.zip",
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={run_id}_golden.zip"},
+            background=background_tasks
+        )
+    except Exception as e:
+        # Clean up temp file on error
+        if zip_path.exists():
+            zip_path.unlink()
+        log.error(f"[DOWNLOAD_GOLDEN] Error creating zip: {e}")
+        raise HTTPException(500, f"Failed to create zip file: {str(e)}")
+
+
+@app.get("/health")
+def health():
+    """Health check endpoint for testing connectivity"""
+    return {"status": "ok", "message": "Backend is running"}
