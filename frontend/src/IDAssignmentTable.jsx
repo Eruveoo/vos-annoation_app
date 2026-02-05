@@ -57,13 +57,17 @@ export default function IDAssignmentTable({
 
   return (
     <div>
+      <style>{`
+        /* Ensure number inputs are visually centered in WebKit browsers (Chrome/Safari) */
+        .vos-id-input::-webkit-outer-spin-button,
+        .vos-id-input::-webkit-inner-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
+      `}</style>
       <h4 style={{ marginTop: 0, marginBottom: 12 }}>
         Assign IDs to detected masks
       </h4>
-      <p style={{ fontSize: 12, color: "#666", marginBottom: 12 }}>
-        Review and change IDs if needed (e.g., to continue from a previous video
-        segment). Uncheck to delete a mask.
-      </p>
 
       <div style={{ overflowX: "auto" }}>
         <table
@@ -71,21 +75,24 @@ export default function IDAssignmentTable({
             width: "100%",
             borderCollapse: "collapse",
             fontSize: 14,
+            tableLayout: "fixed",
           }}
         >
+          <colgroup>
+            <col style={{ width: 110 }} />
+            <col style={{ width: 140 }} />
+            <col style={{ width: 80 }} />
+          </colgroup>
           <thead>
             <tr style={{ backgroundColor: "#f5f5f5" }}>
-              <th style={{ padding: 8, textAlign: "left", border: "1px solid #ddd" }}>
-                Mask #
+              <th style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
+                Suggested
               </th>
-              <th style={{ padding: 8, textAlign: "left", border: "1px solid #ddd" }}>
-                Auto-assigned ID
+              <th style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
+                ID
               </th>
-              <th style={{ padding: 8, textAlign: "left", border: "1px solid #ddd" }}>
-                Final ID
-              </th>
-              <th style={{ padding: 8, textAlign: "center", border: "1px solid #ddd" }}>
-                Delete?
+              <th style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
+                Delete
               </th>
             </tr>
           </thead>
@@ -100,31 +107,37 @@ export default function IDAssignmentTable({
                 <tr
                   key={maskIndex}
                   style={{
-                    backgroundColor: isDeleted ? "#ffe6e6" : "white",
+                    backgroundColor: isDeleted ? "#f8f9fa" : "white",
+                    color: isDeleted ? "#adb5bd" : "#212529",
+                    textDecoration: isDeleted ? "line-through" : "none",
                   }}
                 >
-                  <td style={{ padding: 8, border: "1px solid #ddd" }}>
-                    {maskIndex}
-                  </td>
-                  <td style={{ padding: 8, border: "1px solid #ddd" }}>
+                  <td style={{ padding: "8px 6px", border: "1px solid #ddd", textAlign: "center" }}>
                     {autoId}
                   </td>
-                  <td style={{ padding: 8, border: "1px solid #ddd" }}>
+                  <td style={{ padding: "8px 6px", border: "1px solid #ddd", textAlign: "center" }}>
                     <input
+                      className="vos-id-input"
                       type="number"
                       min="1"
                       value={isDeleted ? "" : finalId}
                       onChange={(e) => handleIdChange(maskIndex, e.target.value)}
                       disabled={isDeleted}
                       style={{
-                        width: 80,
-                        padding: 4,
+                        width: 70,
+                        padding: "4px 0",
                         border: "1px solid #ccc",
                         borderRadius: 4,
+                        backgroundColor: isDeleted ? "#f1f3f5" : "white",
+                        color: isDeleted ? "#adb5bd" : "#212529",
+                        textAlign: "center",
+                        appearance: "textfield",
+                        MozAppearance: "textfield",
+                        lineHeight: "20px",
                       }}
                     />
                   </td>
-                  <td style={{ padding: 8, textAlign: "center", border: "1px solid #ddd" }}>
+                  <td style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
                     <input
                       type="checkbox"
                       checked={isDeleted}

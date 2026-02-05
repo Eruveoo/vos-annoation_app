@@ -1,0 +1,25 @@
+# FastAPI and web server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Image processing
+# Note: numpy<2 required for SAM-3 compatibility
+numpy>=1.26,<2.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# SAM-3 model (install from source or pip if available)
+# Note: SAM-3 may need to be installed separately from:
+# https://github.com/facebookresearch/segment-anything-3
+# sam3>=0.1.0
+
+# Hugging Face for model access (if using gated models)
+huggingface-hub>=0.19.0
+
+# Additional utilities
+python-multipart>=0.0.6  # Required for FastAPI file uploads

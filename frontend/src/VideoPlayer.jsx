@@ -5,8 +5,10 @@ import React, { useState, useRef, useEffect } from "react";
  * @param {string} videoUrl - URL to the video
  * @param {string} label - Label for the video
  * @param {number} height - Display height
+ * @param {number} progress - Optional progress percentage (0-100)
+ * @param {string} progressMessage - Optional progress message
  */
-export default function VideoPlayer({ videoUrl, label, height = 480 }) {
+export default function VideoPlayer({ videoUrl, label, height = 480, progress = null, progressMessage = null }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const videoRef = useRef(null);
@@ -62,19 +64,60 @@ export default function VideoPlayer({ videoUrl, label, height = 480 }) {
 
   if (!videoUrl) {
     return (
-      <div
-        style={{
-          width: "100%",
-          height: `${height}px`,
-          border: "1px solid #ccc",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: "#666",
-          backgroundColor: "#f5f5f5",
-        }}
-      >
-        {label ? `${label}: No video available` : "No video available"}
+      <div>
+        {label && (
+          <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 14 }}>
+            {label}
+          </div>
+        )}
+        <div
+          style={{
+            width: "100%",
+            height: `${height}px`,
+            border: "1px solid #333",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "#666",
+            backgroundColor: "#000",
+            padding: "40px 40px",
+            boxSizing: "border-box",
+          }}
+        >
+          {progress !== null && progress > 0 ? (
+            <div style={{ 
+              width: "100%", 
+              maxWidth: 400,
+            }}>
+              <div style={{ 
+                width: "100%", 
+                height: 8, 
+                backgroundColor: "#e9ecef", 
+                borderRadius: 4,
+                overflow: "hidden",
+                marginBottom: 12
+              }}>
+                <div style={{
+                  height: "100%",
+                  width: `${progress}%`,
+                  backgroundColor: "#28a745",
+                  borderRadius: 4,
+                  transition: "width 0.3s ease"
+                }} />
+              </div>
+              {progressMessage && (
+                <div style={{ fontSize: 14, color: "#6c757d", textAlign: "center" }}>
+                  {progressMessage}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ color: "#666" }}>
+              No video available
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -87,6 +130,52 @@ export default function VideoPlayer({ videoUrl, label, height = 480 }) {
         </div>
       )}
       <div style={{ position: "relative" }}>
+        {/* Progress bar overlay - shows when progress is provided, even if video exists */}
+        {progress !== null && progress >= 0 && (
+          <div
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: "rgba(0, 0, 0, 0.9)",
+              zIndex: 20,
+              padding: 40,
+            }}
+          >
+            <div style={{ 
+              width: "100%", 
+              maxWidth: 400,
+            }}>
+              <div style={{ 
+                width: "100%", 
+                height: 8, 
+                backgroundColor: "#e9ecef", 
+                borderRadius: 4,
+                overflow: "hidden",
+                marginBottom: 12
+              }}>
+                <div style={{
+                  height: "100%",
+                  width: `${progress}%`,
+                  backgroundColor: "#28a745",
+                  borderRadius: 4,
+                  transition: "width 0.3s ease"
+                }} />
+              </div>
+              {progressMessage && (
+                <div style={{ fontSize: 14, color: "#6c757d", textAlign: "center" }}>
+                  {progressMessage}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         {loading && (
           <div
             style={{

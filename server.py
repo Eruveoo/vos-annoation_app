@@ -4,56 +4,34 @@ import shutil
 import subprocess
 import uuid
 import time
+import base64
+import tempfile
+import threading
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Optional, Tuple, Any, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
-# Add SAM-3 to path if not installed as a package
-# This handles cases where SAM-3 is a directory rather than an installed package
-# NOTE: For pkg_resources to work properly, SAM-3 should be installed as a package:
-#   pip install -e sam3/
-# If that's not possible, we add it to sys.path as a fallback.
-SAM3_PATHS = [
-    Path(__file__).parent / "sam3",  # Same directory as server.py (most common case)
-    Path("./sam3"),  # Current working directory
-    Path("../sam3"),  # One level up
-    Path(os.path.expanduser("~/sam3")),  # Home directory
-    Path("/scratch/project_2016918/sam3"),  # Common cluster location
-]
-
-sam3_found = False
-for sam3_path in SAM3_PATHS:
-    sam3_path = sam3_path.resolve()
-    # Check if this is the SAM-3 package directory (should contain sam3/ subdirectory)
-    if sam3_path.exists() and sam3_path.is_dir():
-        # Check if it contains the sam3 package
-        if (sam3_path / "sam3").exists() or (sam3_path / "sam3" / "__init__.py").exists():
-            if str(sam3_path) not in sys.path:
-                sys.path.insert(0, str(sam3_path))
-                logging.getLogger("uvicorn.error").info(f"Added SAM-3 path to sys.path: {sam3_path}")
-                sam3_found = True
-                break
-        # Also check if sam3_path itself is the package (i.e., contains model_builder.py)
-        elif (sam3_path / "model_builder.py").exists():
-            # This means sam3_path is already the sam3 package directory
-            parent = sam3_path.parent
-            if str(parent) not in sys.path:
-                sys.path.insert(0, str(parent))
-                logging.getLogger("uvicorn.error").info(f"Added SAM-3 parent path to sys.path: {parent}")
-                sam3_found = True
-                break
-
-if not sam3_found:
-    logging.getLogger("uvicorn.error").warning(
-        "SAM-3 package not found in common locations. "
-        "Please install SAM-3 as a package: pip install -e sam3/"
-    )
-
+import numpy as np
+import cv2
+from PIL import Image
 from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Optional, Tuple
+import torch
+from sam3.model_builder import build_sam3_image_model, build_sam3_video_predictor
+from sam3.model.sam3_image_processor import Sam3Processor
+import sam3.model_builder
+import pkg_resources
+
+# Fix sam3.__file__ if it's None (namespace package issue with editable installs)
+import sam3
+if not hasattr(sam3, '__file__') or sam3.__file__ is None:
+    if hasattr(sam3.model_builder, '__file__') and sam3.model_builder.__file__:
+        sam3.__file__ = str(Path(sam3.model_builder.__file__).parent.parent / "__init__.py")
 
 # IMPORTANT: use uvicorn logger (so logs show up in uvicorn output)
 log = logging.getLogger("uvicorn.error")
@@ -83,6 +61,39 @@ async def log_requests(request: Request, call_next):
 
 
 # -------------------------
+# Startup: Auto-load ffmpeg module if needed
+# -------------------------
+@app.on_event("startup")
+async def startup_load_ffmpeg():
+    """Automatically load ffmpeg module if ffmpeg is not found in PATH."""
+    if shutil.which("ffmpeg"):
+        return
+    
+    log.info("ffmpeg not found, attempting to load module...")
+    try:
+        # Run module load and capture the updated PATH
+        result = subprocess.run(
+            ["bash", "-c", "module load ffmpeg && echo $PATH"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Update the current process's PATH with the module-loaded PATH
+            new_path = result.stdout.strip()
+            os.environ["PATH"] = new_path
+            if shutil.which("ffmpeg"):
+                log.info("Successfully loaded ffmpeg module")
+            else:
+                log.warning("Module load command ran but ffmpeg still not found in PATH")
+        else:
+            log.warning("Could not load ffmpeg module")
+    except Exception as e:
+        log.debug(f"Could not load ffmpeg module: {e}")
+
+
+# -------------------------
 # Config / paths
 # -------------------------
 XMEM_REPO = "./XMem"
@@ -97,6 +108,14 @@ MASK_THRESHOLD = 0.5
 # - Projappl: 50GB space, 100K files (21G used, 101K files - FILE LIMIT EXCEEDED!)
 RUNS_ROOT = Path("/scratch/project_2016918/vos_annotation_runs")
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Progress tracking for upload/prepare operations
+# Key: run_id, Value: {"stage": "upload"|"extract", "progress": 0-100, "message": str}
+prepare_progress: Dict[str, Dict] = {}
+
+# Progress tracking for tracking operations
+# Key: run_id, Value: {"stage": "tracking"|"rendering", "progress": 0-100, "message": str, "current_frame": int, "total_frames": int}
+track_progress: Dict[str, Dict] = {}
 
 LOG_EVERY_FRAMES_EXTRACT = 200
 LOG_EVERY_FRAMES_RENDER = 200
@@ -114,6 +133,40 @@ def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def copy_files_parallel(src_dst_pairs: list, max_workers: int = 8):
+    """
+    Copy multiple files in parallel using ThreadPoolExecutor.
+    
+    Args:
+        src_dst_pairs: List of (src_path, dst_path) tuples
+        max_workers: Maximum number of parallel copy operations
+    
+    Returns:
+        Number of successfully copied files
+    """
+    def copy_one(src_dst):
+        src, dst = src_dst
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            return True
+        except Exception as e:
+            log.warning(f"Failed to copy {src} to {dst}: {e}")
+            return False
+    
+    if not src_dst_pairs:
+        return 0
+    
+    copied = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(copy_one, pair): pair for pair in src_dst_pairs}
+        for future in as_completed(futures):
+            if future.result():
+                copied += 1
+    
+    return copied
+
+
 def parse_meta_file(meta_path: Path) -> dict:
     """Parse a meta.txt file, skipping empty lines and lines without '='."""
     if not meta_path.exists():
@@ -127,7 +180,6 @@ def parse_meta_file(meta_path: Path) -> dict:
 
 
 def masks_to_label_map(masks_bool):
-    import numpy as np
     H, W = masks_bool[0].shape
     label = np.zeros((H, W), dtype=np.uint8)
     for i, m in enumerate(masks_bool, start=1):
@@ -136,9 +188,189 @@ def masks_to_label_map(masks_bool):
 
 
 def random_color(seed: int):
-    import numpy as np
     rng = np.random.RandomState(seed)
     return tuple(int(x) for x in rng.randint(50, 255, size=3))
+
+
+# -------------------------
+# Helper functions for common operations
+# -------------------------
+
+def get_color_for_id(id: int, min_val: int = 50) -> Tuple[int, int, int]:
+    """
+    Get a consistent color for a given ID.
+    Uses RandomState to ensure same ID always gets same color.
+    
+    Args:
+        id: The ID to get a color for
+        min_val: Minimum RGB value (default 50 for better visibility)
+    
+    Returns:
+        Tuple of (R, G, B) values
+    """
+    rng = np.random.RandomState(id)
+    return tuple(int(x) for x in rng.randint(min_val, 255, size=3))
+
+
+def encode_frame_to_base64(frame: np.ndarray, quality: int = 90) -> str:
+    """
+    Encode a frame (numpy array) to base64 JPEG string.
+    
+    Args:
+        frame: Frame as numpy array (BGR format from cv2)
+        quality: JPEG quality (0-100)
+    
+    Returns:
+        Base64-encoded JPEG string
+    
+    Raises:
+        HTTPException: If encoding fails
+    """
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to encode frame")
+    return base64.b64encode(buf.tobytes()).decode('utf-8')
+
+
+def load_frame_safely(frame_path: Path, frame_idx: Optional[int] = None) -> np.ndarray:
+    """
+    Load a frame from disk safely.
+    
+    Args:
+        frame_path: Path to frame image
+        frame_idx: Optional frame index for error messages
+    
+    Returns:
+        Frame as numpy array (BGR format)
+    
+    Raises:
+        HTTPException: If frame cannot be read
+    """
+    frame = cv2.imread(str(frame_path))
+    if frame is None:
+        idx_msg = f" {frame_idx}" if frame_idx is not None else ""
+        raise HTTPException(500, f"Could not read frame{idx_msg} from {frame_path}")
+    return frame
+
+
+def load_masks_safely(masks_file: Path) -> List[np.ndarray]:
+    """
+    Load masks from .npy file and ensure they are boolean numpy arrays.
+    
+    Args:
+        masks_file: Path to .npy file containing masks
+    
+    Returns:
+        List of boolean numpy arrays
+    """
+    masks_raw = np.load(masks_file, allow_pickle=True)
+    masks = []
+    for i, m in enumerate(masks_raw):
+        if not isinstance(m, np.ndarray):
+            log.warning(f"Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
+            m = np.asarray(m)
+        if m.dtype != bool:
+            log.warning(f"Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
+            m = (m > 0.5).astype(bool)
+        masks.append(m)
+    return masks
+
+
+def load_assignments_or_default(assignments_file: Path, n_masks: int) -> Dict[int, int]:
+    """
+    Load ID assignments from file or create default mapping.
+    
+    Args:
+        assignments_file: Path to .npy file containing assignments dict
+        n_masks: Number of masks (for default mapping)
+    
+    Returns:
+        Dictionary mapping mask_index -> final_id
+    """
+    if assignments_file.exists():
+        assignments = np.load(assignments_file, allow_pickle=True).item()
+        return assignments
+    else:
+        # Default: mask_idx -> mask_idx + 1
+        return {i: i + 1 for i in range(n_masks)}
+
+
+def render_mask_overlay(frame: np.ndarray, mask: np.ndarray, mask_id: int, color: Tuple[int, int, int], 
+                        alpha: float = 0.4, font_scale: float = 0.8) -> np.ndarray:
+    """
+    Render a mask overlay on a frame with ID label.
+    
+    Args:
+        frame: Frame as numpy array (BGR format)
+        mask: Boolean mask array
+        mask_id: ID to display on mask
+        color: RGB color tuple for overlay
+        alpha: Overlay transparency (0.0-1.0)
+        font_scale: Font scale for ID text
+    
+    Returns:
+        Frame with mask overlay and ID label
+    """
+    if not mask.any():
+        return frame
+    
+    overlay = frame.copy()
+    overlay[mask] = color
+    frame = cv2.addWeighted(frame, 1.0 - alpha, overlay, alpha, 0)
+    
+    # Add ID label at centroid
+    ys, xs = np.where(mask)
+    if len(ys) > 0:
+        cx, cy = int(xs.mean()), int(ys.mean())
+        text = str(mask_id)
+        thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        text_x = cx - text_width // 2
+        text_y = cy + text_height // 2
+        
+        cv2.putText(
+            frame,
+            text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+    
+    return frame
+
+
+# Path helper functions
+def get_golden_ann_dir(run_dir: Path) -> Path:
+    """Get golden annotations directory path."""
+    return run_dir / "golden" / "Annotations" / VIDEO_NAME
+
+
+def get_golden_jpeg_dir(run_dir: Path) -> Path:
+    """Get golden JPEG images directory path."""
+    return run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+
+
+def get_jpeg_dir(run_dir: Path) -> Path:
+    """Get source JPEG images directory path."""
+    return run_dir / "xmem_generic" / "JPEGImages" / VIDEO_NAME
+
+
+def get_init_masks_file(run_dir: Path) -> Path:
+    """Get init masks file path."""
+    return run_dir / "init" / "init_masks.npy"
+
+
+def get_correction_masks_file(run_dir: Path, frame_idx: int) -> Path:
+    """Get correction masks file path for a specific frame."""
+    return run_dir / "correction_masks" / f"correction_masks_{frame_idx}.npy"
+
+
+def get_correction_assignments_file(run_dir: Path, frame_idx: int) -> Path:
+    """Get correction assignments file path for a specific frame."""
+    return run_dir / "correction_masks" / f"correction_assignments_{frame_idx}.npy"
 
 
 # -------------------------
@@ -149,60 +381,30 @@ PROCESSOR = None
 VIDEO_PREDICTOR = None
 
 
+def _ensure_sam3_assets():
+    """Patch pkg_resources to find SAM-3 BPE tokenizer file in correct location."""
+    sam3_package_dir = Path(sam3.model_builder.__file__).parent
+    bpe_file = sam3_package_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+    pkg_resources_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
+    if not Path(pkg_resources_path).exists() and bpe_file.exists():
+        original_fn = pkg_resources.resource_filename
+        def patched_fn(package, resource):
+            if package == "sam3" and "bpe_simple_vocab_16e6.txt.gz" in resource:
+                return str(bpe_file)
+            return original_fn(package, resource)
+        pkg_resources.resource_filename = patched_fn
+
+
 def get_model():
     global MODEL, PROCESSOR
     if MODEL is None:
         log.info("Loading SAM-3 model...")
         t0 = time.perf_counter()
-        
-        # Check for Hugging Face token for gated model access
-        # Try multiple sources: environment variables, or saved token file
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        
-        # If not in environment, try reading from saved token file
-        # Check multiple locations: HF_HOME, then home directory
-        if not hf_token:
-            # Try HF_HOME first (if set)
-            hf_home = os.environ.get("HF_HOME")
-            if hf_home:
-                token_file = Path(hf_home) / "token"
-                if token_file.exists():
-                    try:
-                        hf_token = token_file.read_text().strip()
-                        log.info(f"Found Hugging Face token in HF_HOME: {token_file}")
-                    except Exception as e:
-                        log.warning(f"Could not read token file from HF_HOME: {e}")
-            
-            # Fallback to home directory
-            if not hf_token:
-                token_file = Path.home() / ".huggingface" / "token"
-                if token_file.exists():
-                    try:
-                        hf_token = token_file.read_text().strip()
-                        log.info("Found Hugging Face token in ~/.huggingface/token")
-                    except Exception as e:
-                        log.warning(f"Could not read token file: {e}")
-        
-        if hf_token:
-            log.info("Using Hugging Face token for authentication")
-            os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
-        else:
-            log.warning("No Hugging Face token found. Model download may fail if not cached.")
-        
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
+        _ensure_sam3_assets()
         MODEL = build_sam3_image_model()
         PROCESSOR = Sam3Processor(MODEL)
         log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s")
     return PROCESSOR
-
-
-def _gpu_ids():
-    """Get GPU IDs (exactly like testing_backend.py)"""
-    import torch
-    if torch.cuda.is_available():
-        return [torch.cuda.current_device()]
-    return []
 
 
 def get_video_predictor(force_reinit=False):
@@ -214,44 +416,8 @@ def get_video_predictor(force_reinit=False):
             VIDEO_PREDICTOR = None
         log.info("Loading SAM-3 video predictor...")
         t0 = time.perf_counter()
-        
-        # Check for Hugging Face token for gated model access
-        # Try multiple sources: environment variables, or saved token file
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        
-        # If not in environment, try reading from saved token file
-        # Check multiple locations: HF_HOME, then home directory
-        if not hf_token:
-            # Try HF_HOME first (if set)
-            hf_home = os.environ.get("HF_HOME")
-            if hf_home:
-                token_file = Path(hf_home) / "token"
-                if token_file.exists():
-                    try:
-                        hf_token = token_file.read_text().strip()
-                        log.info(f"[VIDEO_PREDICTOR] Found Hugging Face token in HF_HOME: {token_file}")
-                    except Exception as e:
-                        log.warning(f"[VIDEO_PREDICTOR] Could not read token file from HF_HOME: {e}")
-            
-            # Fallback to home directory
-            if not hf_token:
-                token_file = Path.home() / ".huggingface" / "token"
-                if token_file.exists():
-                    try:
-                        hf_token = token_file.read_text().strip()
-                        log.info("[VIDEO_PREDICTOR] Found Hugging Face token in ~/.huggingface/token")
-                    except Exception as e:
-                        log.warning(f"[VIDEO_PREDICTOR] Could not read token file: {e}")
-        
-        if hf_token:
-            log.info("[VIDEO_PREDICTOR] Using Hugging Face token for authentication")
-            os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
-        else:
-            log.warning("[VIDEO_PREDICTOR] No Hugging Face token found. Model download may fail if not cached.")
-        
-        from sam3.model_builder import build_sam3_video_predictor
-        gpu_ids = _gpu_ids()  # Use same function as testing_backend
-        log.info(f"[VIDEO_PREDICTOR] Building with GPU IDs: {gpu_ids}")
+        _ensure_sam3_assets()
+        gpu_ids = [torch.cuda.current_device()] if torch.cuda.is_available() else []
         VIDEO_PREDICTOR = build_sam3_video_predictor(gpus_to_use=gpu_ids)
         log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s")
     return VIDEO_PREDICTOR
@@ -262,10 +428,7 @@ def extract_instances_from_formatted(formatted0, img_w=None, img_h=None):
     Extract instances from formatted SAM3 output (exactly like testing_backend.py).
     Returns list of dicts: [{"obj_id": int, "mask": HxW float(0/1), "score": float}, ...]
     """
-    import numpy as np
     import torch
-    from typing import Any, Dict, List
-    from PIL import Image
     
     instances: List[Dict[str, Any]] = []
     
@@ -358,8 +521,6 @@ def safe_mask_hw(mask, h: int, w: int):
     """
     Ensure mask is HxW float32 in [0,1] (exactly like testing_backend.py).
     """
-    import numpy as np
-    import cv2
     m = mask.astype(np.float32)
     if m.ndim == 3 and m.shape[0] == 1:
         m = m[0]
@@ -490,39 +651,25 @@ def _ffmpeg_drop_seed_frame(in_mp4: Path, out_mp4: Path, fps: float) -> bool:
 # -------------------------
 # Core pipeline
 # -------------------------
-def extract_frames(video_path: str, jpeg_dir: Path):
+def extract_frames(video_path: str, jpeg_dir: Path, progress_callback=None):
     """
     Extract frames from video using OpenCV, with ffmpeg fallback if OpenCV fails.
+    
+    Args:
+        video_path: Path to video file
+        jpeg_dir: Directory to save extracted frames
+        progress_callback: Optional callback(progress: float, message: str) for progress updates
     """
-    import cv2
-
     log.info(f"Extracting frames from {video_path}")
-    
-    # Check if file exists
-    if not os.path.exists(video_path):
-        raise RuntimeError(f"Video file does not exist: {video_path}")
-    
-    file_size = os.path.getsize(video_path)
-    log.info(f"Video file size: {file_size} bytes")
-    if file_size == 0:
-        raise RuntimeError(f"Video file is empty: {video_path}")
-    
     t0 = time.perf_counter()
 
     # Try OpenCV first
     try:
         cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"OpenCV cannot open video: {video_path}")
-        
-        # Set timeout for reading (30 seconds)
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)
 
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            log.warning(f"OpenCV could not determine FPS, trying ffmpeg fallback")
-            cap.release()
-            raise RuntimeError("OpenCV failed to read video properties")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
         
         frames = []
         idx = 0
@@ -535,31 +682,43 @@ def extract_frames(video_path: str, jpeg_dir: Path):
             cv2.imwrite(str(jpeg_dir / fname), frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
             frames.append(fname)
             idx += 1
-            if idx % LOG_EVERY_FRAMES_EXTRACT == 0:
-                log.info(f"  extracted {idx} frames...")
+            
+            # Update progress
+            if progress_callback and total_frames:
+                progress = min(100, (idx / total_frames) * 100)
+                if idx % 50 == 0 or idx == total_frames:
+                    progress_callback(progress, f"Extracted {idx}/{total_frames} frames...")
+            elif progress_callback and (idx % 100 == 0 or idx % LOG_EVERY_FRAMES_EXTRACT == 0):
+                estimated_total = 3000
+                estimated_progress = min(95, (idx / estimated_total) * 100)
+                progress_callback(estimated_progress, f"Extracted {idx} frames...")
 
         cap.release()
         
-        if len(frames) == 0:
-            raise RuntimeError("OpenCV extracted 0 frames")
+        if progress_callback:
+            progress_callback(100, f"Extracted {len(frames)} frames")
         
         log.info(f"Frame extraction done: {len(frames)} frames ({time.perf_counter()-t0:.2f}s)")
         return frames, fps
         
     except Exception as e:
         log.warning(f"OpenCV extraction failed: {e}, trying ffmpeg fallback")
-        # Fallback to ffmpeg
-        return _extract_frames_ffmpeg(video_path, jpeg_dir)
+        return _extract_frames_ffmpeg(video_path, jpeg_dir, progress_callback)
 
 
-def _extract_frames_ffmpeg(video_path: str, jpeg_dir: Path):
+def _extract_frames_ffmpeg(video_path: str, jpeg_dir: Path, progress_callback=None):
     """
     Extract frames using ffmpeg (more robust for problematic videos).
+    
+    Args:
+        video_path: Path to video file
+        jpeg_dir: Directory to save extracted frames
+        progress_callback: Optional callback(progress: float, message: str) for progress updates
     """
     log.info(f"Using ffmpeg to extract frames from {video_path}")
     t0 = time.perf_counter()
     
-    # Get FPS using ffprobe
+    # Get FPS and frame count using ffprobe
     fps_cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -583,6 +742,26 @@ def _extract_frames_ffmpeg(video_path: str, jpeg_dir: Path):
     
     log.info(f"Detected FPS: {fps}")
     
+    # Get total frame count for progress
+    count_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-show_entries", "stream=nb_read_frames",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    total_frames = None
+    try:
+        count_result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=10)
+        if count_result.returncode == 0:
+            total_frames = int(count_result.stdout.strip()) if count_result.stdout.strip() else None
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass  # Can't get frame count, will estimate
+    
+    if progress_callback:
+        progress_callback(0, "Starting frame extraction with ffmpeg...")
+    
     # Extract frames using ffmpeg
     output_pattern = str(jpeg_dir / "%05d.jpg")
     cmd = [
@@ -594,6 +773,8 @@ def _extract_frames_ffmpeg(video_path: str, jpeg_dir: Path):
     
     log.info(f"Running ffmpeg: {' '.join(cmd)}")
     try:
+        # For ffmpeg, we can't easily track progress during extraction
+        # We'll update progress after completion
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
@@ -608,13 +789,15 @@ def _extract_frames_ffmpeg(video_path: str, jpeg_dir: Path):
     if len(frames) == 0:
         raise RuntimeError("ffmpeg extracted 0 frames")
     
+    if progress_callback:
+        progress_callback(100, f"Extracted {len(frames)} frames")
+    
     log.info(f"Frame extraction done: {len(frames)} frames ({time.perf_counter()-t0:.2f}s)")
     return frames, fps
 
 
 def compute_iou(mask1, mask2) -> float:
     """Compute Intersection over Union (IoU) between two boolean masks."""
-    import numpy as np
     intersection = np.logical_and(mask1, mask2).sum()
     union = np.logical_or(mask1, mask2).sum()
     if union == 0:
@@ -624,7 +807,6 @@ def compute_iou(mask1, mask2) -> float:
 
 def compute_centroid_distance(mask1, mask2) -> float:
     """Compute distance between centroids of two masks."""
-    import numpy as np
     ys1, xs1 = np.where(mask1)
     ys2, xs2 = np.where(mask2)
     if len(xs1) == 0 or len(xs2) == 0:
@@ -647,7 +829,6 @@ def auto_assign_ids(new_masks: list, prev_label_map, iou_threshold: float = 0.2,
         iou_threshold: Minimum IoU to consider a match (default 0.2)
         allow_new_ids: If False, prevents creating new IDs (unmatched masks are dropped)
     """
-    import numpy as np
     
     if prev_label_map.max() == 0:
         # No previous masks, assign new IDs only if allowed
@@ -755,8 +936,6 @@ def run_sam3_on_frame(prompt: str, frame_path: Path) -> list:
     """
     Run SAM-3 on a specific frame and return list of boolean masks.
     """
-    from PIL import Image
-    import numpy as np
     
     log.info(f"SAM-3 on frame {frame_path}, prompt={prompt}")
     processor = get_model()
@@ -784,8 +963,6 @@ def run_sam3_on_frame(prompt: str, frame_path: Path) -> list:
 
 
 def run_sam3_on_first_frame(prompt, jpeg_dir, ann_dir, frames):
-    from PIL import Image
-    import numpy as np
 
     log.info(f"SAM-3 on frame0, prompt={prompt}")
     processor = get_model()
@@ -818,20 +995,18 @@ def run_sam3_on_first_frame(prompt, jpeg_dir, ann_dir, frames):
 
 
 def golden_progress(run_dir: Path, n_total: int):
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     if not golden_ann_dir.exists():
         log.info(f"[GOLDEN_PROGRESS] Golden annotations dir does not exist: {golden_ann_dir}")
         return 0, 0.0, None
 
     pngs = sorted(golden_ann_dir.glob("*.png"))
-    if not pngs:
-        log.info(f"[GOLDEN_PROGRESS] No PNG files found in {golden_ann_dir}")
-        return 0, 0.0, None
-
     def idx_from_name(p: Path) -> int:
         return int(p.stem)
 
     frame_indices = [idx_from_name(p) for p in pngs]
+    if not frame_indices:
+        return 0, 0.0, None
     max_idx = max(frame_indices)
     processed = max_idx + 1
     pct = (processed / max(n_total, 1)) * 100.0
@@ -857,14 +1032,12 @@ def make_chunk_dataset(run_dir: Path, seed_idx: int, end_idx: int, seed_ann_path
     src_jpeg = src_root / "JPEGImages" / VIDEO_NAME
 
     # Use provided seed annotation (from auto-reset) or fall back to golden
-    if seed_ann_path and seed_ann_path.exists():
-        seed_ann = seed_ann_path
+    if seed_ann_path:
+        seed_ann = seed_ann_path  # Will fail on copy if missing
         log.info(f"Using auto-reset seed annotation: {seed_ann}")
     else:
-        golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
-        seed_ann = golden_ann_dir / f"{seed_idx:05d}.png"
-        if not seed_ann.exists():
-            raise RuntimeError(f"Missing golden seed annotation: {seed_ann}")
+        golden_ann_dir = get_golden_ann_dir(run_dir)
+        seed_ann = golden_ann_dir / f"{seed_idx:05d}.png"  # Will fail on copy if missing
 
     dst_root = run_dir / "work_chunk" / f"{seed_idx:05d}_{end_idx:05d}"
     dst_jpeg = dst_root / "JPEGImages" / VIDEO_NAME
@@ -880,11 +1053,8 @@ def make_chunk_dataset(run_dir: Path, seed_idx: int, end_idx: int, seed_ann_path
     n = 0
     for orig_idx in range(seed_idx, end_idx + 1):
         src = src_jpeg / f"{orig_idx:05d}.jpg"
-        if not src.exists():
-            raise RuntimeError(f"Missing source frame: {src}")
-
         dst = dst_jpeg / f"{n:05d}.jpg"
-        shutil.copy2(src, dst)
+        shutil.copy2(src, dst)  # Will raise FileNotFoundError if src missing
         n += 1
 
     # Copy seed annotation to 00000.png (required by XMem)
@@ -958,11 +1128,8 @@ def find_xmem_pngs(xmem_output: Path):
 def render_video(jpeg_dir: Path, frames, found_pngs, out_video: Path, fps: float, n_ids: int):
     """
     Render all provided frames list (same length as found_pngs ideally).
+    Uses direct ffmpeg encoding from processed frame images (faster, more reliable).
     """
-    import cv2
-    import numpy as np
-    from PIL import Image
-
     if not frames:
         raise RuntimeError("render_video got empty frames list")
 
@@ -973,65 +1140,86 @@ def render_video(jpeg_dir: Path, frames, found_pngs, out_video: Path, fps: float
     H, W = first.shape[:2]
 
     out_video.parent.mkdir(parents=True, exist_ok=True)
-    # Use H.264 codec (avc1) for better browser compatibility
-    # Fallback to mp4v if avc1 is not available
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
-    writer = cv2.VideoWriter(str(out_video), fourcc, fps, (W, H))
-    if not writer.isOpened():
-        log.warning("avc1 codec not available, falling back to mp4v")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_video), fourcc, fps, (W, H))
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not open VideoWriter with codec mp4v for {out_video}")
     colors = {i: random_color(i) for i in range(1, n_ids + 1)}
 
     T = min(len(frames), len(found_pngs))
-    for t in range(T):
-        frame = cv2.imread(str(jpeg_dir / frames[t]))
-        if frame is None:
-            raise RuntimeError(f"Could not read frame {frames[t]}")
-        mask = np.array(Image.open(found_pngs[t]))
+    
+    # Process frames and write to temporary directory, then encode with ffmpeg
+    with tempfile.TemporaryDirectory(prefix="render_video_") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        
+        log.debug(f"Processing {T} frames to temporary directory: {tmpdir_path}")
+        for t in range(T):
+            frame = cv2.imread(str(jpeg_dir / frames[t]))
+            if frame is None:
+                raise RuntimeError(f"Could not read frame {frames[t]}")
+            mask = np.array(Image.open(found_pngs[t]))
 
-        for cid, col in colors.items():
-            m = (mask == cid)
-            if not m.any():
-                continue
+            for cid, col in colors.items():
+                m = (mask == cid)
+                if not m.any():
+                    continue
 
-            overlay = frame.copy()
-            overlay[m] = col
-            frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
+                overlay = frame.copy()
+                overlay[m] = col
+                frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
 
-            ys, xs = np.where(m)
-            cx, cy = int(xs.mean()), int(ys.mean())
-            
-            # Get text size to center it properly
-            text = str(cid)
-            font_scale = 0.8
-            thickness = 2
-            (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-            
-            # Center the text (putText uses bottom-left corner, so adjust)
-            text_x = cx - text_width // 2
-            text_y = cy + text_height // 2
-            
-            cv2.putText(
-                frame,
-                text,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (255, 255, 255),
-                thickness,
-                cv2.LINE_AA,
-            )
+                ys, xs = np.where(m)
+                cx, cy = int(xs.mean()), int(ys.mean())
+                
+                # Get text size to center it properly
+                text = str(cid)
+                font_scale = 0.8
+                thickness = 2
+                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                
+                # Center the text (putText uses bottom-left corner, so adjust)
+                text_x = cx - text_width // 2
+                text_y = cy + text_height // 2
+                
+                cv2.putText(
+                    frame,
+                    text,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA,
+                )
 
-        writer.write(frame)
+            # Write processed frame to temp directory (use quality 85 for faster I/O)
+            frame_path = tmpdir_path / f"frame_{t:05d}.jpg"
+            cv2.imwrite(str(frame_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
-        if (t + 1) % LOG_EVERY_FRAMES_RENDER == 0:
-            log.info(f"  rendered {t+1}/{T}")
+            if (t + 1) % LOG_EVERY_FRAMES_RENDER == 0:
+                log.debug(f"  processed {t+1}/{T} frames")
 
-    writer.release()
-    log.info("Rendering done")
+        # Encode video directly with ffmpeg (single pass, H.264)
+        log.debug(f"Encoding video with ffmpeg from {T} frames...")
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", f"{fps:.10f}",
+            "-i", str(tmpdir_path / "frame_%05d.jpg"),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",  # Good quality for preview videos
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(out_video),
+        ]
+        
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            if p.returncode != 0:
+                log.error(f"ffmpeg encoding failed with return code {p.returncode}")
+                log.error(f"ffmpeg output:\n{p.stdout[-2000:] if p.stdout else '(no output)'}")
+                raise RuntimeError(f"Failed to encode video with ffmpeg: {out_video}")
+        except FileNotFoundError:
+            log.error("ffmpeg not found in PATH. Cannot render video without ffmpeg.")
+            raise RuntimeError("ffmpeg is required for video rendering but was not found in PATH")
+
+    log.info(f"Rendering done: {out_video}")
     return T
 
 
@@ -1040,14 +1228,12 @@ def _render_segment_from_golden(run_dir: Path, fps: float, n_ids: int, start_idx
     Render golden overlay segment for frames start_idx..end_idx inclusive into out_path.
     Uses original JPEGs + golden label PNGs.
     """
-    import numpy as np
-    from PIL import Image
     
     log.info(f"[RENDER_GOLDEN] Rendering segment: frames {start_idx}..{end_idx} -> {out_path}")
     
     src_root = run_dir / "xmem_generic"
     src_jpeg = src_root / "JPEGImages" / VIDEO_NAME
-    golden_ann = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann = get_golden_ann_dir(run_dir)
 
     log.info(f"[RENDER_GOLDEN] Source JPEG dir: {src_jpeg}")
     log.info(f"[RENDER_GOLDEN] Golden annotations dir: {golden_ann}")
@@ -1198,23 +1384,17 @@ def _ffmpeg_concat(a: Path, b: Path, out: Path, fps: float) -> bool:
 # -------------------------
 # API
 # -------------------------
-@app.post("/init")
-def init(video_path: str, prompt: str):
+@app.post("/prepare")
+def prepare(video_path: str):
     """
-    Initialize a new annotation session:
-    1. Extract frames from video
-    2. Run SAM-3 on frame 0
-    3. Return masks for manual ID assignment (don't save annotation yet)
+    Prepare a new annotation session WITHOUT running SAM:
+    1. Create run directory
+    2. Extract frames (this is the expensive part)
+    3. Write meta.txt (prompt left empty for now)
+    4. Return run_id + basic video metadata + source preview URL
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import JSONResponse
-    
-    log.info(f"/init video={video_path} prompt={prompt}")
 
-    if not os.path.exists(video_path):
-        raise HTTPException(400, f"Video not found: {video_path}")
+    log.info(f"/prepare video={video_path}")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
     run_dir = RUNS_ROOT / run_id
@@ -1223,15 +1403,298 @@ def init(video_path: str, prompt: str):
     jpeg_dir = custom_root / "JPEGImages" / VIDEO_NAME
     ann_dir = custom_root / "Annotations" / VIDEO_NAME
 
-    ensure_clean_dir(run_dir)
     jpeg_dir.mkdir(parents=True, exist_ok=True)
     ann_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract frames
     frames, fps = extract_frames(video_path, jpeg_dir)
+
+    cap = cv2.VideoCapture(str(video_path))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else None
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else None
+    cap.release()
+
+    # Save metadata (prompt empty for now - will be set in /init_sam)
+    (run_dir / "meta.txt").write_text(
+        f"video_path={video_path}\n"
+        f"prompt=\n"
+        f"fps={fps}\n"
+        f"frames={len(frames)}\n"
+        f"ids=0\n"
+    )
+
+    source_url = f"/source/{run_id}"
+
+    return {
+        "run_id": run_id,
+        "fps": fps,
+        "n_frames_total": len(frames),
+        "width": width,
+        "height": height,
+        "source_url": source_url,
+    }
+
+
+def _do_frame_extraction(run_id: str, video_path: Path, jpeg_dir: Path, run_dir: Path, safe_name: str):
+    """
+    Background task to extract frames and save metadata.
+    This allows the frontend to poll for progress during extraction.
+    """
     
-    # Run SAM-3 on frame 0 (but don't save annotation yet)
-    log.info(f"[INIT] Running SAM-3 on frame 0, prompt={prompt}")
+    try:
+        # Update progress for frame extraction
+        prepare_progress[run_id] = {"stage": "extract", "progress": 0, "message": "Starting frame extraction..."}
+        log.info(f"[PREPARE_UPLOAD] Starting frame extraction for {run_id}")
+
+        # Progress callback for frame extraction
+        last_logged_progress = [-1]  # Use list to allow modification in closure
+        def update_extract_progress(progress, message):
+            if progress is not None:
+                prepare_progress[run_id] = {
+                    "stage": "extract",
+                    "progress": progress,
+                    "message": message
+                }
+                # Only log every 10% to reduce verbosity
+                if int(progress) // 10 != int(last_logged_progress[0]) // 10:
+                    log.info(f"[PREPARE_UPLOAD] Extract progress: {progress:.1f}% - {message}")
+                    last_logged_progress[0] = progress
+            else:
+                # Keep current progress, just update message
+                current = prepare_progress.get(run_id, {})
+                prepare_progress[run_id] = {
+                    "stage": "extract",
+                    "progress": current.get("progress", 0),
+                    "message": message
+                }
+
+        # Extract frames
+        frames, fps = extract_frames(str(video_path), jpeg_dir, progress_callback=update_extract_progress)
+        log.info(f"[PREPARE_UPLOAD] Frame extraction complete: {len(frames)} frames")
+
+        # Best-effort metadata
+        width = None
+        height = None
+        try:
+            cap = cv2.VideoCapture(str(video_path))
+            if cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+            cap.release()
+        except Exception:
+            pass
+
+        # Save metadata (prompt empty for now - will be set in /init_sam)
+        (run_dir / "meta.txt").write_text(
+            f"video_path={video_path}\n"
+            f"prompt=\n"
+            f"fps={fps}\n"
+            f"frames={len(frames)}\n"
+            f"ids=0\n"
+        )
+
+        # Mark as completed but keep it for a bit so frontend can see it
+        prepare_progress[run_id] = {
+            "stage": "extract",
+            "progress": 100,
+            "message": "Completed"
+        }
+        
+        # Clear progress after 10 seconds (give frontend time to poll)
+        def clear_progress_later():
+            time.sleep(10)
+            prepare_progress.pop(run_id, None)
+            log.info(f"[PREPARE_UPLOAD] Cleared progress for {run_id}")
+        
+        threading.Thread(target=clear_progress_later, daemon=True).start()
+        
+    except Exception as e:
+        log.error(f"[PREPARE_UPLOAD] Frame extraction failed for {run_id}: {e}")
+        prepare_progress[run_id] = {
+            "stage": "extract",
+            "progress": 0,
+            "message": f"Error: {str(e)}"
+        }
+        raise
+
+
+@app.post("/prepare_upload")
+async def prepare_upload(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
+    """
+    Prepare a new annotation session from a video uploaded via multipart/form-data.
+    Saves the uploaded video into the run directory, then extracts frames (like /prepare).
+    Returns run_id immediately after upload, extraction happens in background.
+    """
+    
+    if not file or not file.filename:
+        raise HTTPException(400, "No file uploaded")
+
+    log.info(f"/prepare_upload filename={file.filename} content_type={file.content_type}")
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    run_dir = RUNS_ROOT / run_id
+
+    custom_root = run_dir / "xmem_generic"
+    jpeg_dir = custom_root / "JPEGImages" / VIDEO_NAME
+    ann_dir = custom_root / "Annotations" / VIDEO_NAME
+
+    jpeg_dir.mkdir(parents=True, exist_ok=True)  # Creates all parent dirs including run_dir
+    ann_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize progress tracking
+    prepare_progress[run_id] = {"stage": "upload", "progress": 0, "message": "Starting upload..."}
+    log.info(f"[PREPARE_UPLOAD] Started, run_id={run_id}, filename={file.filename}")
+
+    # Save uploaded file into the run directory
+    uploads_dir = run_dir / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename).name  # strip any path components
+    video_path = uploads_dir / safe_name
+
+    try:
+        # Get file size for progress tracking
+        # Note: FastAPI's UploadFile might not support seek, so we'll track as we read
+        uploaded = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        log.info(f"[PREPARE_UPLOAD] Starting file upload to {video_path}")
+        
+        with open(video_path, "wb") as f:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                uploaded += len(chunk)
+                # Update progress (we don't know total size, so estimate based on chunks)
+                # For now, we'll just show "uploading" until done
+                prepare_progress[run_id] = {
+                    "stage": "upload",
+                    "progress": min(95, uploaded / (10 * 1024 * 1024) * 100),  # Estimate: assume ~10MB for 95%
+                    "message": f"Uploading... {uploaded / (1024*1024):.1f} MB"
+                }
+                log.debug(f"[PREPARE_UPLOAD] Uploaded {uploaded} bytes")
+    except Exception as e:
+        log.error(f"[PREPARE_UPLOAD] Upload error: {e}")
+        prepare_progress.pop(run_id, None)
+        raise
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        log.error(f"[PREPARE_UPLOAD] Upload failed: file is empty or missing")
+        prepare_progress.pop(run_id, None)
+        raise HTTPException(500, "Uploaded file save failed (empty file)")
+
+    log.info(f"[PREPARE_UPLOAD] Upload complete, file size: {video_path.stat().st_size} bytes")
+    prepare_progress[run_id] = {"stage": "upload", "progress": 100, "message": "Upload complete, starting extraction..."}
+
+    # Schedule frame extraction in background
+    # This allows us to return run_id immediately so frontend can start polling
+    background_tasks.add_task(_do_frame_extraction, run_id, video_path, jpeg_dir, run_dir, safe_name)
+
+    # Return immediately with run_id (extraction will happen in background)
+    # Frontend will poll for progress and get final results when done
+    return JSONResponse({
+        "run_id": run_id,
+        "fps": None,  # Will be available after extraction
+        "n_frames_total": None,  # Will be available after extraction
+        "width": None,  # Will be available after extraction
+        "height": None,  # Will be available after extraction
+        "source_url": f"/source/{run_id}",
+        "uploaded_filename": safe_name,
+        "status": "uploaded",  # Indicates extraction is in progress
+    })
+
+
+@app.get("/prepare_upload_progress/{run_id}")
+def get_prepare_upload_progress(run_id: str):
+    """
+    Get progress for prepare_upload operation.
+    Returns progress info if operation is in progress, or final metadata if completed.
+    """
+    progress = prepare_progress.get(run_id)
+    if progress is None:
+        # Check if extraction is actually done by checking if meta.txt exists
+        run_dir = RUNS_ROOT / run_id
+        meta_path = run_dir / "meta.txt"
+        if meta_path.exists():
+            try:
+                meta = parse_meta_file(meta_path)
+                # Get video dimensions
+                video_path = meta.get("video_path", "")
+                width = None
+                height = None
+                if video_path and os.path.exists(video_path):
+                    try:
+                        cap = cv2.VideoCapture(str(video_path))
+                        if cap.isOpened():
+                            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+                            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+                        cap.release()
+                    except Exception:
+                        pass
+                
+                log.info(f"[PROGRESS] {run_id}: completed (found meta.txt)")
+                return {
+                    "status": "completed",
+                    "progress": 100,
+                    "message": "Completed",
+                    "fps": float(meta.get("fps", 0)) if meta.get("fps") else None,
+                    "n_frames_total": int(meta.get("frames", 0)) if meta.get("frames") else None,
+                    "width": width,
+                    "height": height,
+                }
+            except Exception as e:
+                log.warning(f"[PROGRESS] {run_id}: meta.txt exists but couldn't parse: {e}")
+        
+        log.info(f"[PROGRESS] {run_id}: not found (completed or never started)")
+        return {"status": "completed", "progress": 100, "message": "Completed"}
+    
+    return {
+        "status": "in_progress",
+        "stage": progress["stage"],
+        "progress": progress["progress"],
+        "message": progress["message"]
+    }
+
+
+@app.post("/init_sam/{run_id}")
+def init_sam(run_id: str, prompt: str):
+    """
+    Run SAM initialization on frame 0 for an EXISTING prepared run.
+    This avoids re-extracting frames and makes Page 1 \"Load Video\" meaningful.
+    """
+    
+    run_dir = RUNS_ROOT / run_id
+    meta_path = run_dir / "meta.txt"
+    if not meta_path.exists():
+        raise HTTPException(404, "run_id not found (missing meta.txt)")
+
+    meta = parse_meta_file(meta_path)
+    video_path = meta.get("video_path", "")
+    if not video_path or not os.path.exists(video_path):
+        raise HTTPException(400, f"Video not found for run_id: {video_path}")
+
+    custom_root = run_dir / "xmem_generic"
+    jpeg_dir = custom_root / "JPEGImages" / VIDEO_NAME  # Note: custom_root may differ from run_dir
+    ann_dir = custom_root / "Annotations" / VIDEO_NAME
+    if not jpeg_dir.exists():
+        raise HTTPException(400, "Frames not prepared. Run /prepare first.")
+    ann_dir.mkdir(parents=True, exist_ok=True)
+
+    fps = float(meta.get("fps", 30.0))
+
+    frames = sorted([p.name for p in jpeg_dir.glob("*.jpg")])
+    if len(frames) == 0:
+        raise HTTPException(400, "No extracted frames found. Run /prepare first.")
+
+    log.info(f"/init_sam run_id={run_id} prompt={prompt} frames={len(frames)} fps={fps}")
+
+    # Run SAM-3 on frame 0 (EXACTLY like /init)
+    log.info(f"[INIT_SAM] Running SAM-3 on frame 0, prompt={prompt}")
     processor = get_model()
     first_path = jpeg_dir / frames[0]
     img = Image.open(first_path).convert("RGB")
@@ -1240,7 +1703,7 @@ def init(video_path: str, prompt: str):
     state = processor.set_image(img)
     out = processor.set_text_prompt(state=state, prompt=prompt)
 
-    log.info(f"[INIT] SAM-3 raw masks: {len(out['masks'])}")
+    log.info(f"[INIT_SAM] SAM-3 raw masks: {len(out['masks'])}")
 
     masks = []
     for m in out["masks"]:
@@ -1253,87 +1716,57 @@ def init(video_path: str, prompt: str):
         raise RuntimeError("No valid masks from SAM-3")
 
     n_masks = len(masks)
-    log.info(f"[INIT] SAM-3 kept {n_masks} masks")
-    
-    # Save masks temporarily for later use
-    masks_file = run_dir / "init_masks.npy"
+    log.info(f"[INIT_SAM] SAM-3 kept {n_masks} masks")
+
+    # Save init masks
+    masks_file = get_init_masks_file(run_dir)
+    masks_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(masks_file, masks)
-    
+
     # Render preview image with auto-assigned IDs (1, 2, 3, ...)
     frame = np.array(img)
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    
-    def color_for(id: int):
-        np.random.seed(id * 42)
-        return tuple(map(int, np.random.randint(0, 255, 3)))
-    
-    log.info(f"[INIT] Rendering {n_masks} masks with auto-assigned IDs")
+
     for mask_idx, mask in enumerate(masks, start=1):
-        assigned_id = mask_idx  # Auto-assign sequential IDs: 1, 2, 3, ...
-        mask_pixels = int(mask.sum())
-        log.info(f"[INIT] Rendering mask {mask_idx-1} -> ID {assigned_id} ({mask_pixels} pixels)")
-        col = color_for(assigned_id)
+        assigned_id = mask_idx
+        col = get_color_for_id(assigned_id, min_val=0)
         overlay = frame.copy()
         overlay[mask] = col
         frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
-        
+
         ys, xs = np.where(mask)
         if len(ys) == 0:
             continue
         cx, cy = int(xs.mean()), int(ys.mean())
-        
-        text = str(assigned_id)
-        font_scale = 0.8
-        thickness = 2
-        (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        text_x = cx - text_width // 2
-        text_y = cy + text_height // 2
-        
         cv2.putText(
             frame,
-            text,
-            (text_x, text_y),
+            str(assigned_id),
+            (cx, cy),
             cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
+            0.8,
             (255, 255, 255),
-            thickness,
+            2,
             cv2.LINE_AA,
         )
-    
-    # Encode preview image
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
-    
-    # Prepare response
-    mask_assignments = [
-        {
-            "mask_index": mask_idx,
-            "auto_assigned_id": mask_idx + 1,  # IDs start from 1
+
+    image_b64 = encode_frame_to_base64(frame, quality=90)
+
+    mask_assignments = [{"mask_index": i, "auto_assigned_id": i + 1} for i in range(n_masks)]
+
+    # Update meta with prompt (keep fps/frames/ids)
+    meta["prompt"] = prompt
+    meta_path.write_text("\n".join(f"{k}={v}" for k, v in meta.items()))
+
+    log.info(f"[INIT_SAM] Returning {n_masks} masks for ID assignment")
+    return JSONResponse(
+        content={
+            "run_id": run_id,
+            "fps": fps,
+            "n_frames_total": len(frames),
+            "image": f"data:image/jpeg;base64,{image_b64}",
+            "mask_assignments": mask_assignments,
         }
-        for mask_idx in range(n_masks)
-    ]
-    
-    # Save metadata (without n_ids yet - will be updated after ID assignment)
-    (run_dir / "meta.txt").write_text(
-        f"video_path={video_path}\n"
-        f"prompt={prompt}\n"
-        f"fps={fps}\n"
-        f"frames={len(frames)}\n"
-        f"ids=0\n"  # Will be updated after ID assignment
     )
-    
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-    
-    log.info(f"[INIT] Returning {n_masks} masks for ID assignment")
-    return JSONResponse(content={
-        "run_id": run_id,
-        "fps": fps,
-        "n_frames_total": len(frames),
-        "image": f"data:image/jpeg;base64,{image_b64}",
-        "mask_assignments": mask_assignments,
-    })
 
 
 class IDMapping(BaseModel):
@@ -1351,11 +1784,6 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
     Uses the same IoU-based matching as auto_assign_ids.
     Accepts an uploaded PNG mask file.
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import JSONResponse
-    import tempfile
     
     log.info(f"/match_init_ids run_id={run_id} uploaded_file={file.filename}")
     
@@ -1364,11 +1792,8 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
         raise HTTPException(404, f"Run not found: {run_id}")
     
     # Load saved masks from init
-    masks_file = run_dir / "init_masks.npy"
-    if not masks_file.exists():
-        raise HTTPException(400, "Masks not found. Please run /init first.")
-    
-    new_masks = np.load(masks_file, allow_pickle=True)
+    masks_file = get_init_masks_file(run_dir)
+    new_masks = np.load(masks_file, allow_pickle=True)  # Will raise FileNotFoundError if missing
     log.info(f"[MATCH_INIT_IDS] Loaded {len(new_masks)} new masks from init")
     
     # Save uploaded file temporarily and load it
@@ -1401,7 +1826,7 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
     # Render preview image with matched IDs
     meta = parse_meta_file(run_dir / "meta.txt")
     custom_root = run_dir / "xmem_generic"
-    jpeg_dir = custom_root / "JPEGImages" / VIDEO_NAME
+    jpeg_dir = custom_root / "JPEGImages" / VIDEO_NAME  # Note: custom_root may differ from run_dir
     first_path = jpeg_dir / "00000.jpg"
     
     if not first_path.exists():
@@ -1411,14 +1836,10 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
     if frame is None:
         raise HTTPException(500, "Could not read frame 0")
     
-    def color_for(id: int):
-        np.random.seed(id * 42)
-        return tuple(map(int, np.random.randint(0, 255, 3)))
-    
     # Render masks with matched IDs
     for mask_idx, mask in enumerate(new_masks):
         matched_id = assignments.get(mask_idx, mask_idx + 1)
-        col = color_for(matched_id)
+        col = get_color_for_id(matched_id, min_val=0)
         overlay = frame.copy()
         overlay[mask] = col
         frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -1447,9 +1868,7 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
         )
     
     # Encode preview image
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
+    image_b64 = encode_frame_to_base64(frame, quality=90)
     
     # Prepare response
     mask_assignments = [
@@ -1460,9 +1879,6 @@ def match_init_ids(run_id: str, file: UploadFile = File(...)):
         }
         for mask_idx, matched_id in sorted(assignments.items())
     ]
-    
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
     
     log.info(f"[MATCH_INIT_IDS] Returning {len(mask_assignments)} matched assignments ({matched_count}/{total_count} matched to previous IDs)")
     return JSONResponse(content={
@@ -1479,10 +1895,6 @@ def preview_init_update(run_id: str, preview_update: PreviewUpdate):
     Regenerate frame 0 preview image with current ID mappings and deletions.
     Used for real-time preview updates as user edits the table.
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import JSONResponse
     
     log.info(f"/preview_init_update run_id={run_id}")
     log.info(f"Preview update mapping: {preview_update.mapping}")
@@ -1492,29 +1904,16 @@ def preview_init_update(run_id: str, preview_update: PreviewUpdate):
         raise HTTPException(404, f"Run not found: {run_id}")
     
     # Load saved masks from init
-    masks_file = run_dir / "init_masks.npy"
-    if not masks_file.exists():
-        raise HTTPException(400, "Masks not found. Please run /init first.")
-    
-    masks = np.load(masks_file, allow_pickle=True)
+    masks_file = get_init_masks_file(run_dir)
+    masks = np.load(masks_file, allow_pickle=True)  # Will raise FileNotFoundError if missing
     log.info(f"[PREVIEW_INIT_UPDATE] Loaded {len(masks)} masks from init")
     
     # Load frame 0 image
     src_root = run_dir / "xmem_generic"
     jpeg_dir = src_root / "JPEGImages" / VIDEO_NAME
     frame_path = jpeg_dir / "00000.jpg"
-    
-    if not frame_path.exists():
-        raise HTTPException(404, "Frame 0 not found")
-    
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, "Could not read frame 0")
+    frame = load_frame_safely(frame_path, frame_idx=0)  # Will raise HTTPException if missing
     frame = frame.copy()  # Make a copy to avoid modifying original
-    
-    def color_for(i: int):
-        np.random.seed(i * 42)
-        return tuple(map(int, np.random.randint(0, 255, 3)))
     
     # Render masks with user's current ID mappings (skip deleted ones)
     rendered_count = 0
@@ -1527,14 +1926,8 @@ def preview_init_update(run_id: str, preview_update: PreviewUpdate):
         if final_id <= 0:
             continue
         
-        mask = masks[mask_idx]
-        # Ensure mask is boolean
-        if not isinstance(mask, np.ndarray):
-            mask = np.asarray(mask)
-        if mask.dtype != bool:
-            mask = (mask > 0.5).astype(bool)
-        
-        col = color_for(final_id)
+        mask = masks[mask_idx]  # Already validated as boolean by load_masks_safely()
+        col = get_color_for_id(final_id, min_val=0)
         overlay = frame.copy()
         overlay[mask] = col
         frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -1565,12 +1958,7 @@ def preview_init_update(run_id: str, preview_update: PreviewUpdate):
     
     log.info(f"Rendered {rendered_count} masks in preview")
     
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
-    
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    image_b64 = encode_frame_to_base64(frame, quality=90)
     
     return JSONResponse(content={
         "image": f"data:image/jpeg;base64,{image_b64}",
@@ -1583,20 +1971,12 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     Apply user's ID mapping to frame 0 masks and complete initialization.
     This creates the annotation file, golden folder, and preview video.
     """
-    import numpy as np
-    from PIL import Image
-    
     log.info(f"/apply_init_ids run_id={run_id} mapping={id_mapping.mapping}")
     
     run_dir = RUNS_ROOT / run_id
-    if not run_dir.exists():
-        raise HTTPException(404, f"Run not found: {run_id}")
     
     # Load saved masks
-    masks_file = run_dir / "init_masks.npy"
-    if not masks_file.exists():
-        raise HTTPException(400, "Masks not found. Please run /init first.")
-    
+    masks_file = get_init_masks_file(run_dir)
     masks = np.load(masks_file, allow_pickle=True)
     n_masks = len(masks)
     
@@ -1615,8 +1995,6 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     
     for mask_idx_str, final_id in id_mapping.mapping.items():
         mask_idx = int(mask_idx_str)
-        if mask_idx >= n_masks:
-            raise HTTPException(400, f"Invalid mask_index {mask_idx} (max: {n_masks-1})")
         final_id = int(final_id)
         if final_id <= 0:  # Skip deleted masks
             continue
@@ -1626,49 +2004,35 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     ann0 = ann_dir / "00000.png"
     Image.fromarray(label_map).save(ann0)
     n_ids = int(label_map.max())
-    log.info(f"[APPLY_INIT_IDS] Saved annotation with {n_ids} objects, IDs={sorted([id for id in np.unique(label_map) if id > 0])}")
+    log.info(f"[APPLY_INIT_IDS] Saved annotation with {n_ids} objects")
     
     # Create golden folder + seed frame0 annotation
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     ensure_dir(golden_ann_dir)
     shutil.copy2(ann0, golden_ann_dir / "00000.png")
     
     # Also copy frame0 JPEG to golden/JPEGImages/video1/
-    golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+    golden_jpeg_dir = get_golden_jpeg_dir(run_dir)
     ensure_dir(golden_jpeg_dir)
     shutil.copy2(jpeg_dir / "00000.jpg", golden_jpeg_dir / "00000.jpg")
     
     # Initialize golden preview video with frame0
-    try:
-        log.info("[APPLY_INIT_IDS] Initializing golden preview video with frame0...")
-        seg0 = run_dir / "golden_segments" / "00000_00000.mp4"
-        ensure_dir(seg0.parent)
-        log.info(f"[APPLY_INIT_IDS] Rendering segment 0-0 to {seg0}")
-        _render_segment_from_golden(run_dir, fps, n_ids, 0, 0, seg0)
-        
-        if not seg0.exists():
-            raise RuntimeError(f"Segment file was not created: {seg0}")
-        
-        golden_preview_init = run_dir / "golden" / "golden_preview.mp4"
-        ensure_dir(golden_preview_init.parent)
-        golden_preview_init.write_bytes(seg0.read_bytes())
-        
-        # Re-encode to ensure browser-compatible format
-        log.info("[APPLY_INIT_IDS] Re-encoding golden_preview.mp4 to browser-compatible format...")
-        golden_preview_tmp = run_dir / "golden" / "golden_preview_tmp.mp4"
-        if _ffmpeg_reencode_video(golden_preview_init, golden_preview_tmp, fps):
-            golden_preview_tmp.replace(golden_preview_init)
-            log.info("[APPLY_INIT_IDS] ✅ Golden preview initialized")
-        else:
-            log.warning("[APPLY_INIT_IDS] Re-encoding failed, keeping original")
-    except Exception as e:
-        log.error(f"[APPLY_INIT_IDS] ❌ Golden preview init failed (non-fatal): {e}", exc_info=True)
+    seg0 = run_dir / "golden_segments" / "00000_00000.mp4"
+    ensure_dir(seg0.parent)
+    _render_segment_from_golden(run_dir, fps, n_ids, 0, 0, seg0)
+    
+    golden_preview_init = run_dir / "golden" / "golden_preview.mp4"
+    ensure_dir(golden_preview_init.parent)
+    golden_preview_init.write_bytes(seg0.read_bytes())
+    
+    # Re-encode to ensure browser-compatible format
+    golden_preview_tmp = run_dir / "golden" / "golden_preview_tmp.mp4"
+    if _ffmpeg_reencode_video(golden_preview_init, golden_preview_tmp, fps):
+        golden_preview_tmp.replace(golden_preview_init)
     
     # Update metadata with final n_ids
     meta_content = meta_path.read_text()
-    meta_path.write_text(
-        meta_content.replace("ids=0", f"ids={n_ids}")
-    )
+    meta_path.write_text(meta_content.replace("ids=0", f"ids={n_ids}"))
     
     # Clean up temporary masks file
     masks_file.unlink()
@@ -1676,68 +2040,7 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     log.info(f"[APPLY_INIT_IDS] Initialization complete: run_id={run_id}, n_ids={n_ids}")
     return {"run_id": run_id, "n_ids": n_ids}
 
-
-@app.post("/resume")
-def resume(run_id: str):
-    """Resume an existing annotation session."""
-    log.info(f"/resume run_id={run_id}")
     
-    run_dir = RUNS_ROOT / run_id
-    if not run_dir.exists():
-        raise HTTPException(404, f"Run not found: {run_id}")
-    
-    meta_path = run_dir / "meta.txt"
-    if not meta_path.exists():
-        raise HTTPException(400, f"Run metadata not found: {meta_path}")
-    
-    # Read metadata
-    meta = parse_meta_file(meta_path)
-    video_path = meta.get("video_path", "")
-    prompt = meta.get("prompt", "")
-    fps = float(meta.get("fps", "0"))
-    n_frames_total = int(meta.get("frames", "0"))
-    n_ids = int(meta.get("ids", "0"))
-    
-    # Verify video still exists
-    if not os.path.exists(video_path):
-        raise HTTPException(400, f"Original video not found: {video_path}")
-    
-    log.info(f"/resume done run_id={run_id}, video={video_path}, prompt={prompt}, fps={fps}, frames={n_frames_total}, ids={n_ids}")
-    return {"run_id": run_id, "fps": fps, "n_frames_total": n_frames_total, "n_ids": n_ids, "video_path": video_path, "prompt": prompt}
-
-
-@app.post("/save")
-def save(run_id: str):
-    """Create a backup/snapshot of the current run by copying it to a new run_id."""
-    log.info(f"/save run_id={run_id}")
-    
-    run_dir = RUNS_ROOT / run_id
-    if not run_dir.exists():
-        raise HTTPException(404, f"Run not found: {run_id}")
-    
-    # Create new backup run_id
-    backup_run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
-    backup_run_dir = RUNS_ROOT / backup_run_id
-    
-    log.info(f"Creating backup: {run_id} -> {backup_run_id}")
-    
-    # Copy entire run directory (pure copy, no modifications)
-    # Use dirs_exist_ok=False to ensure we don't overwrite anything
-    shutil.copytree(run_dir, backup_run_dir, dirs_exist_ok=False)
-    log.info(f"Backup created: {backup_run_dir}")
-    
-    # Store backup info in a separate file (don't modify meta.txt)
-    backup_info_path = backup_run_dir / "backup_info.txt"
-    backup_info_path.write_text(
-        f"backup_of={run_id}\n"
-        f"backup_created={datetime.now().isoformat()}\n"
-    )
-    log.info(f"Backup info saved to: {backup_info_path}")
-    
-    log.info(f"/save done: backup_run_id={backup_run_id}")
-    return {"backup_run_id": backup_run_id, "original_run_id": run_id}
-
-
 @app.post("/track")
 def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query(None)):
     """
@@ -1758,6 +2061,12 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
     meta_path = run_dir / "meta.txt"
     if not meta_path.exists():
         raise HTTPException(404, "run_id not found (missing meta.txt)")
+
+    # Always start a tracking run with a clean chunks directory so we don't mix
+    # old tracked chunks with a new tracking session. Older tracked chunks are
+    # not needed once a new tracking run starts.
+    chunks_dir = run_dir / "chunks"
+    ensure_clean_dir(chunks_dir)
 
     meta = parse_meta_file(meta_path)
     fps = float(meta["fps"])
@@ -1786,6 +2095,17 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
         }
 
     log.info(f"Tracking chunk seed={seed_idx} -> end={end_idx} (new frames: {seed_idx+1}..{end_idx})")
+    
+    # Initialize tracking progress IMMEDIATELY (before any processing)
+    total_frames_to_track = end_idx - seed_idx
+    track_progress[run_id] = {
+        "stage": "tracking",
+        "progress": 0,
+        "message": f"Preparing to track {total_frames_to_track} frames...",
+        "current_frame": seed_idx,
+        "total_frames": end_idx,
+    }
+    log.info(f"[TRACK] Progress initialized: 0% - Preparing to track {total_frames_to_track} frames...")
 
     # If auto_reset_interval is set, split tracking into multiple chunks
     if auto_reset_interval is not None and auto_reset_interval > 0:
@@ -1822,6 +2142,17 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
             
             log.info(f"--- Processing chunk: frames {current_seed}..{chunk_end} ---")
             
+            # Update progress
+            frames_processed = current_seed - seed_idx
+            progress_pct = min(90, int((frames_processed / total_frames_to_track) * 100))
+            track_progress[run_id] = {
+                "stage": "tracking",
+                "progress": progress_pct,
+                "message": f"Tracking chunk {current_seed}..{chunk_end} ({frames_processed}/{total_frames_to_track} frames)",
+                "current_frame": current_seed,
+                "total_frames": end_idx,
+            }
+            
             # Check if we need SAM reset for this chunk (before processing)
             # If we have a seed from previous chunk, use it; otherwise check for SAM reset
             seed_ann_path = prev_chunk_seed_ann_path
@@ -1830,8 +2161,6 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
             should_reset = (current_seed > seed_idx) and ((current_seed - seed_idx) % auto_reset_interval == 0)
             
             if should_reset:
-                import numpy as np
-                from PIL import Image
                 
                 log.info(f"🔄 Auto-reset: Running SAM on frame {current_seed} (reset interval: {auto_reset_interval})")
                 
@@ -1871,7 +2200,7 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
                     
                     # Fall back to golden if not found in chunks
                     if prev_label_map is None:
-                        golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+                        golden_ann_dir = get_golden_ann_dir(run_dir)
                         prev_ann_path = golden_ann_dir / f"{prev_frame_idx:05d}.png"
                         if prev_ann_path.exists():
                             prev_label_map = np.array(Image.open(prev_ann_path))
@@ -1922,24 +2251,20 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
                 ensure_dir(chunk_ann_dir)
                 
                 # Copy seed annotation
-                if seed_ann_path and seed_ann_path.exists():
-                    shutil.copy2(seed_ann_path, chunk_ann_dir / "00000.png")
+                if seed_ann_path:
+                    shutil.copy2(seed_ann_path, chunk_ann_dir / "00000.png")  # Will fail if missing
                 else:
-                    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+                    golden_ann_dir = get_golden_ann_dir(run_dir)
                     golden_seed = golden_ann_dir / f"{current_seed:05d}.png"
-                    if golden_seed.exists():
-                        shutil.copy2(golden_seed, chunk_ann_dir / "00000.png")
+                    shutil.copy2(golden_seed, chunk_ann_dir / "00000.png")  # Will fail if missing
                 
                 all_chunk_roots.append(chunk_root)
                 log.info(f"✅ Chunk {current_seed} (single frame, no XMem)")
                 
                 # For single-frame chunk, the seed for next chunk is this frame's annotation
                 single_frame_ann = chunk_ann_dir / "00000.png"
-                if single_frame_ann.exists():
-                    prev_chunk_seed_ann_path = single_frame_ann
-                    log.info(f"Saved seed annotation for next chunk: {prev_chunk_seed_ann_path} (frame {current_seed})")
-                else:
-                    log.warning(f"Single-frame chunk annotation not found: {single_frame_ann}")
+                prev_chunk_seed_ann_path = single_frame_ann
+                log.info(f"Saved seed annotation for next chunk: {prev_chunk_seed_ann_path} (frame {current_seed})")
                 
                 # Move to next chunk
                 next_seed = chunk_end + 1
@@ -1960,6 +2285,16 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
             # Run XMem on this chunk
             xmem_output = run_dir / "xmem_outputs" / f"{current_seed:05d}_{chunk_end:05d}"
             ensure_dir(xmem_output.parent)
+            
+            # Update progress before XMem
+            track_progress[run_id] = {
+                "stage": "tracking",
+                "progress": progress_pct,
+                "message": f"Running XMem on chunk {current_seed}..{chunk_end}...",
+                "current_frame": current_seed,
+                "total_frames": end_idx,
+            }
+            
             logs = run_xmem(chunk_ds, xmem_output)
             masks = find_xmem_pngs(xmem_output)
             
@@ -2056,14 +2391,40 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
         
     else:
         # Original behavior: single chunk, no auto-reset
+        track_progress[run_id] = {
+            "stage": "tracking",
+            "progress": 10,
+            "message": f"Preparing to track {total_frames_to_track} frames...",
+            "current_frame": seed_idx,
+            "total_frames": end_idx,
+        }
+        
         seed_ann_path = None
         chunk_ds = make_chunk_dataset(run_dir, seed_idx, end_idx, seed_ann_path=seed_ann_path)
+
+        # Update progress before XMem
+        track_progress[run_id] = {
+            "stage": "tracking",
+            "progress": 30,
+            "message": "Running XMem...",
+            "current_frame": seed_idx,
+            "total_frames": end_idx,
+        }
 
         # Run XMem on this chunk dataset
         xmem_output = run_dir / "xmem_outputs" / f"{seed_idx:05d}_{end_idx:05d}"
         ensure_dir(xmem_output.parent)
         logs = run_xmem(chunk_ds, xmem_output)
         masks = find_xmem_pngs(xmem_output)
+        
+        # Update progress after XMem
+        track_progress[run_id] = {
+            "stage": "tracking",
+            "progress": 80,
+            "message": "Processing masks...",
+            "current_frame": end_idx,
+            "total_frames": end_idx,
+        }
 
         # Store masks into stable chunk folder (still renumbered 00000..)
         chunk_root = run_dir / "chunks" / f"{seed_idx:05d}_{end_idx:05d}"
@@ -2077,6 +2438,15 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
             copied += 1
         log.info(f"Stored chunk masks: {chunk_ann_dir} ({copied} pngs)")
 
+    # Update progress: rendering
+    track_progress[run_id] = {
+        "stage": "rendering",
+        "progress": 95,
+        "message": "Rendering preview video...",
+        "current_frame": end_idx,
+        "total_frames": end_idx,
+    }
+    
     # Render preview for the chunk dataset
     jpeg_dir = chunk_ds / "JPEGImages" / VIDEO_NAME
     frames = sorted([p.name for p in jpeg_dir.glob("*.jpg")])
@@ -2091,26 +2461,7 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
     )
 
     tracked_path = run_dir / "tracked.mp4"
-    
-    # Re-encode tracked.mp4 to ensure browser-compatible format (H.264)
-    # This fixes the issue where mp4v codec fallback isn't supported by browsers
-    # Only re-encode if the file exists and has content
-    if tracked_path.exists() and tracked_path.stat().st_size > 0:
-        log.info(f"[TRACK] Re-encoding tracked.mp4 to browser-compatible H.264 format...")
-        tracked_tmp = run_dir / "tracked_tmp.mp4"
-        if _ffmpeg_reencode_video(tracked_path, tracked_tmp, fps):
-            # Verify the re-encoded file is valid before replacing
-            if tracked_tmp.exists() and tracked_tmp.stat().st_size > 0:
-                tracked_tmp.replace(tracked_path)
-                log.info(f"[TRACK] ✅ tracked.mp4 re-encoded successfully")
-            else:
-                log.warning(f"[TRACK] ⚠️  Re-encoded file is invalid, keeping original")
-                if tracked_tmp.exists():
-                    tracked_tmp.unlink()
-        else:
-            log.warning(f"[TRACK] ⚠️  Re-encoding failed, keeping original (may not work in browser)")
-    else:
-        log.warning(f"[TRACK] ⚠️  tracked.mp4 doesn't exist or is empty, skipping re-encode")
+    # Note: tracked.mp4 is already H.264 encoded by render_video() using direct ffmpeg, no re-encoding needed
     
     chunk_new = chunk_root / "chunk_new.mp4"   # stored with the chunk
     log.info(f"Preparing chunk_new.mp4: dropping seed frame from {tracked_path} -> {chunk_new}")
@@ -2131,6 +2482,24 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
     )
 
     log.info(f"/track done rendered={used}")
+    
+    # Mark tracking as complete
+    track_progress[run_id] = {
+        "stage": "completed",
+        "progress": 100,
+        "message": "Tracking complete!",
+        "current_frame": end_idx,
+        "total_frames": end_idx,
+    }
+    
+    # Clear progress after 5 seconds
+    def clear_track_progress_later():
+        time.sleep(5)
+        track_progress.pop(run_id, None)
+        log.debug(f"[TRACK] Cleared progress for {run_id}")
+    
+    threading.Thread(target=clear_track_progress_later, daemon=True).start()
+    
     return {
         "run_id": run_id,
         "seed_idx": seed_idx,
@@ -2218,12 +2587,12 @@ def commit(run_id: str):
                 f"Using chunk_root-derived values."
             )
 
-    log.info(f"[COMMIT] Starting commit: chunk_root={chunk_root}, seed_idx={seed_idx}, end_idx={end_idx}")
+    log.info(f"[COMMIT] Starting commit: seed_idx={seed_idx}, end_idx={end_idx}")
     
     if not chunk_ann_dir.exists():
         raise HTTPException(500, f"Chunk annotations missing: {chunk_ann_dir}")
 
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     ensure_dir(golden_ann_dir)
     
     # Find all chunks that need to be committed.
@@ -2235,9 +2604,7 @@ def commit(run_id: str):
     chunks_dir = run_dir / "chunks"
     all_chunks_to_commit = []
     if chunks_dir.exists():
-        log.info(f"[COMMIT] Scanning chunks directory: {chunks_dir}")
         all_chunk_folders = sorted([f for f in chunks_dir.iterdir() if f.is_dir()])
-        log.info(f"[COMMIT] Found {len(all_chunk_folders)} chunk folders: {[f.name for f in all_chunk_folders]}")
         
         # Determine an upper bound we are willing to commit up to for this call.
         # Use the end_idx derived from last_chunk, but also consider the maximum chunk_end we see on disk.
@@ -2253,7 +2620,6 @@ def commit(run_id: str):
         commit_end_limit = end_idx
         if max_chunk_end_on_disk is not None and max_chunk_end_on_disk > commit_end_limit:
             commit_end_limit = max_chunk_end_on_disk
-        log.info(f"[COMMIT] Commit end limit for chunk scan: {commit_end_limit} (last_chunk end_idx={end_idx}, max_chunk_end_on_disk={max_chunk_end_on_disk})")
 
         for chunk_folder in all_chunk_folders:
             try:
@@ -2273,11 +2639,6 @@ def commit(run_id: str):
                                 has_missing = True
                                 break
                     should_include = within_limit and has_missing
-                    log.info(
-                        f"[COMMIT] Chunk {name}: seed={chunk_seed}, end={chunk_end}, "
-                        f"last_committed={last_committed_frame}, include={should_include} "
-                        f"(within_limit={within_limit}, has_missing={has_missing})"
-                    )
                     if should_include:
                         all_chunks_to_commit.append((chunk_seed, chunk_end, chunk_folder))
             except (ValueError, IndexError) as e:
@@ -2286,16 +2647,14 @@ def commit(run_id: str):
     
     # If we found chunks, commit them all; otherwise fall back to the last chunk
     if len(all_chunks_to_commit) > 0:
-        log.info(f"[COMMIT] Found {len(all_chunks_to_commit)} chunks to commit: {[(s, e) for s, e, _ in all_chunks_to_commit]}")
+        log.debug(f"[COMMIT] Found {len(all_chunks_to_commit)} chunks to commit")
     else:
-        # Fall back to single chunk commit (original behavior) - but log a warning
-        log.warning(f"[COMMIT] No chunks found in chunks directory, falling back to last_chunk.txt: {seed_idx}..{end_idx}")
+        # Fall back to single chunk commit (original behavior)
         all_chunks_to_commit = [(seed_idx, end_idx, chunk_root)]
-        log.info(f"[COMMIT] Committing single chunk: {seed_idx}..{end_idx}")
 
     # Commit NEW frames only: seed+1..end
     # Also copy JPEG frames to golden/JPEGImages/video1/
-    golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+    golden_jpeg_dir = get_golden_jpeg_dir(run_dir)
     ensure_dir(golden_jpeg_dir)
     
     src_root = run_dir / "xmem_generic"
@@ -2311,7 +2670,7 @@ def commit(run_id: str):
             log.warning(f"[COMMIT] Skipping chunk {chunk_folder.name} - annotations missing")
             continue
         
-        log.info(f"[COMMIT] Processing chunk {chunk_folder.name}: seed={chunk_seed}, end={chunk_end}")
+        log.debug(f"[COMMIT] Processing chunk {chunk_folder.name}: seed={chunk_seed}, end={chunk_end}")
         
         # Check for corrected frames in this chunk's range
         chunk_last_corrected = None
@@ -2321,108 +2680,93 @@ def commit(run_id: str):
                 chunk_rel = orig_idx - chunk_seed
                 chunk_mask_path = chunk_ann_dir_this / f"{chunk_rel:05d}.png"
                 if chunk_mask_path.exists():
-                    from PIL import Image
-                    import numpy as np
                     golden_mask_data = np.array(Image.open(golden_mask))
                     chunk_mask_data = np.array(Image.open(chunk_mask_path))
                     if not np.array_equal(golden_mask_data, chunk_mask_data):
                         chunk_last_corrected = orig_idx
-                        log.info(f"[COMMIT] Frame {orig_idx} is corrected (golden mask differs from chunk mask)")
+                        log.debug(f"[COMMIT] Frame {orig_idx} is corrected (golden mask differs from chunk mask)")
         
         # Determine actual end for this chunk (respect corrected frames)
         chunk_commit_end = chunk_last_corrected if chunk_last_corrected is not None else chunk_end
         if chunk_last_corrected is not None:
-            log.info(f"[COMMIT] Chunk {chunk_folder.name}: found corrected frame at {chunk_last_corrected}, will only commit up to this frame")
+            log.debug(f"[COMMIT] Chunk {chunk_folder.name}: found corrected frame at {chunk_last_corrected}, will only commit up to this frame")
         
         # First, check if the seed frame exists in golden - if not, copy it
         # (The seed frame is at relative index 0 in the chunk)
         seed_mask_src = chunk_ann_dir_this / "00000.png"
         seed_mask_dst = golden_ann_dir / f"{chunk_seed:05d}.png"
         if seed_mask_src.exists() and not seed_mask_dst.exists():
-            log.info(f"[COMMIT] Seed frame {chunk_seed} not in golden, copying it")
+            log.debug(f"[COMMIT] Seed frame {chunk_seed} not in golden, copying it")
             shutil.copy2(seed_mask_src, seed_mask_dst)
             # Also copy JPEG frame
             seed_jpeg_src = src_jpeg / f"{chunk_seed:05d}.jpg"
             if seed_jpeg_src.exists():
                 seed_jpeg_dst = golden_jpeg_dir / f"{chunk_seed:05d}.jpg"
                 shutil.copy2(seed_jpeg_src, seed_jpeg_dst)
-                log.info(f"[COMMIT]   Copied seed frame {chunk_seed} mask and JPEG to golden")
             committed += 1
-        elif seed_mask_dst.exists():
-            log.info(f"[COMMIT] Seed frame {chunk_seed} already exists in golden, skipping")
         
         # Commit frames from this chunk: seed+1 to commit_end (inclusive)
-        log.info(f"[COMMIT] Committing chunk {chunk_folder.name}: frames {chunk_seed + 1} to {chunk_commit_end} (inclusive)")
+        # Collect all files to copy for parallel processing
+        files_to_copy = []
+        jpeg_files_to_copy = []
         
         for orig_idx in range(chunk_seed + 1, chunk_commit_end + 1):
             rel = orig_idx - chunk_seed  # in chunk dataset, seed=0, next frame=1, ...
             src = chunk_ann_dir_this / f"{rel:05d}.png"
             
-            log.info(f"[COMMIT] Processing frame {orig_idx} (relative {rel} in chunk)")
-            log.info(f"[COMMIT]   Source mask: {src} (exists: {src.exists()})")
-            
             if not src.exists():
                 # If the file doesn't exist, it means we've reached the end of the chunk
-                # This can happen if end_idx is one too high, or if the chunk is incomplete
                 log.warning(f"[COMMIT] Missing chunk mask for frame {orig_idx} (relative {rel}) - reached end of chunk, stopping")
                 break
 
             dst = golden_ann_dir / f"{orig_idx:05d}.png"
-            log.info(f"[COMMIT]   Destination: {dst} (exists: {dst.exists()})")
+            
+            # Validate frame index alignment
+            log.debug(f"[COMMIT] Copying frame: chunk_seed={chunk_seed}, orig_idx={orig_idx}, rel={rel}, src={src.name}, dst={dst.name}")
             
             # Check if this frame already has a corrected mask in golden
             if dst.exists():
                 # Load both masks to compare
-                from PIL import Image
-                import numpy as np
                 existing_mask = np.array(Image.open(dst))
                 chunk_mask = np.array(Image.open(src))
                 
-                existing_max_id = int(existing_mask.max())
-                chunk_max_id = int(chunk_mask.max())
-                existing_ids = sorted(list(set(existing_mask.flatten())))
-                existing_ids = [id for id in existing_ids if id > 0]
-                chunk_ids = sorted(list(set(chunk_mask.flatten())))
-                chunk_ids = [id for id in chunk_ids if id > 0]
+                # Validate dimensions match (safety check for frame alignment)
+                if existing_mask.shape != chunk_mask.shape:
+                    log.error(f"[COMMIT] ⚠️  DIMENSION MISMATCH for frame {orig_idx}! Existing: {existing_mask.shape}, Chunk: {chunk_mask.shape}")
+                    log.error(f"[COMMIT] This suggests a frame index mismatch! Skipping this frame.")
+                    continue
                 
                 # Check if masks are different (not just same IDs)
                 masks_different = not np.array_equal(existing_mask, chunk_mask)
                 
-                log.info(f"[COMMIT]   Frame {orig_idx} already exists in golden!")
-                log.info(f"[COMMIT]     Existing mask: max_id={existing_max_id}, IDs={existing_ids}")
-                log.info(f"[COMMIT]     Chunk mask: max_id={chunk_max_id}, IDs={chunk_ids}")
-                log.info(f"[COMMIT]     Masks are different: {masks_different}")
-                
                 if masks_different:
-                    log.warning(f"[COMMIT]   ⚠️  Frame {orig_idx} has corrected mask in golden, but chunk mask is different!")
-                    log.warning(f"[COMMIT]   ⚠️  SKIPPING overwrite - preserving corrected mask in golden")
+                    log.info(f"[COMMIT] Frame {orig_idx} has corrected mask in golden (differs from chunk), skipping overwrite")
                     skipped_corrected += 1
                     # Don't overwrite - keep the corrected mask
                 else:
-                    log.info(f"[COMMIT]   Masks are identical, overwriting is safe")
-                    shutil.copy2(src, dst)
-                    committed += 1
+                    # Masks are identical, safe to overwrite
+                    files_to_copy.append((src, dst))
+                    log.debug(f"[COMMIT] Will copy frame {orig_idx}: {src.name} -> {dst.name}")
             else:
                 # Frame doesn't exist in golden, safe to copy
-                log.info(f"[COMMIT]   Copying new frame {orig_idx} to golden")
-                shutil.copy2(src, dst)
-                
-                # Log mask info
-                from PIL import Image
-                import numpy as np
-                mask = np.array(Image.open(dst))
-                max_id = int(mask.max())
-                unique_ids = sorted(list(set(mask.flatten())))
-                unique_ids = [id for id in unique_ids if id > 0]
-                log.info(f"[COMMIT]   Copied mask: max_id={max_id}, IDs={unique_ids}")
-                committed += 1
+                files_to_copy.append((src, dst))
+                log.debug(f"[COMMIT] Will copy NEW frame {orig_idx}: {src.name} -> {dst.name}")
             
-            # Also copy JPEG frame (always, even if mask was skipped)
+            # Always collect JPEG frame for copying (even if mask was skipped)
             src_jpeg_frame = src_jpeg / f"{orig_idx:05d}.jpg"
             if src_jpeg_frame.exists():
                 dst_jpeg_frame = golden_jpeg_dir / f"{orig_idx:05d}.jpg"
-                shutil.copy2(src_jpeg_frame, dst_jpeg_frame)
-                log.info(f"[COMMIT]   Copied JPEG frame: {dst_jpeg_frame}")
+                jpeg_files_to_copy.append((src_jpeg_frame, dst_jpeg_frame))
+        
+        # Copy all files in parallel
+        if files_to_copy:
+            copied_count = copy_files_parallel(files_to_copy, max_workers=8)
+            committed += copied_count
+            log.debug(f"[COMMIT] Copied {copied_count} mask files in parallel")
+        
+        if jpeg_files_to_copy:
+            copy_files_parallel(jpeg_files_to_copy, max_workers=8)
+            log.debug(f"[COMMIT] Copied {len(jpeg_files_to_copy)} JPEG files in parallel")
 
     # Calculate actual committed range
     if all_chunks_to_commit:
@@ -2442,17 +2786,11 @@ def commit(run_id: str):
     # Simple logic:
     # - If no corrected frames: just append chunk_new.mp4 (tracked preview) to golden preview
     # - If corrected frames exist: append tracked preview up to first corrected frame, then render corrected frames from golden
-    log.info("=" * 60)
-    log.info("[COMMIT] UPDATING GOLDEN PREVIEW VIDEO")
-    log.info("=" * 60)
+    log.debug("[COMMIT] Updating golden preview video")
     try:
         golden_preview = run_dir / "golden" / "golden_preview.mp4"
         chunk_new = chunk_root / "chunk_new.mp4"
         tracked_path = run_dir / "tracked.mp4"
-
-        log.info(f"[COMMIT] golden_preview path: {golden_preview} (exists: {golden_preview.exists()})")
-        log.info(f"[COMMIT] chunk_new path: {chunk_new} (exists: {chunk_new.exists()})")
-        log.info(f"[COMMIT] tracked.mp4 path: {tracked_path} (exists: {tracked_path.exists()})")
         
         # Find the LAST corrected frame in the commit range (if any)
         # If found, we only commit up to that frame and discard everything after
@@ -2464,13 +2802,11 @@ def commit(run_id: str):
                 chunk_rel = orig_idx - seed_idx
                 chunk_mask_path = chunk_ann_dir / f"{chunk_rel:05d}.png"
                 if chunk_mask_path.exists():
-                    from PIL import Image
-                    import numpy as np
                     golden_mask_data = np.array(Image.open(golden_mask))
                     chunk_mask_data = np.array(Image.open(chunk_mask_path))
                     if not np.array_equal(golden_mask_data, chunk_mask_data):
                         last_corrected_frame = orig_idx  # Keep updating to find the LAST one
-                        log.info(f"[COMMIT] Found corrected frame: {last_corrected_frame}")
+                        log.debug(f"[COMMIT] Found corrected frame: {last_corrected_frame}")
         
         if last_corrected_frame is not None:
             log.info(f"[COMMIT] Last corrected frame is {last_corrected_frame}, will only commit up to this frame")
@@ -2533,8 +2869,8 @@ def commit(run_id: str):
                     _ffmpeg_concat(golden_preview, corrected_seg_path, golden_preview, fps)
                 else:
                     golden_preview.write_bytes(corrected_seg_path.read_bytes())
-                log.info(f"[COMMIT] ✅ Golden preview updated: tracked frames {seed_idx+1}..{last_corrected_frame-1} + corrected frame {last_corrected_frame}")
-                log.info(f"[COMMIT] ⚠️  Frames {last_corrected_frame+1}..{int(chunk_kv.get('end_idx', end_idx))} were discarded (will be re-tracked from frame {last_corrected_frame})")
+                log.debug(f"[COMMIT] Golden preview updated: tracked frames {seed_idx+1}..{last_corrected_frame-1} + corrected frame {last_corrected_frame}")
+                log.debug(f"[COMMIT] Frames {last_corrected_frame+1}..{int(chunk_kv.get('end_idx', end_idx))} were discarded (will be re-tracked from frame {last_corrected_frame})")
         else:
             # Full commit: no corrections, just append chunk_new.mp4
             log.info(f"[COMMIT] Full commit: no corrected frames, appending chunk_new.mp4")
@@ -2557,7 +2893,7 @@ def commit(run_id: str):
                         log.info(f"[COMMIT] After concat - golden_preview.mp4: size={final_size} bytes, duration={final_dur}s")
                     
                     if ok:
-                        log.info(f"[COMMIT] ✅ Successfully appended chunk_new to golden_preview.mp4")
+                        log.debug(f"[COMMIT] Successfully appended chunk_new to golden_preview.mp4")
                     else:
                         log.error("[COMMIT] ❌ Concat failed (non-fatal).")
                 else:
@@ -2566,7 +2902,7 @@ def commit(run_id: str):
                     golden_preview.write_bytes(chunk_new.read_bytes())
                     init_size = golden_preview.stat().st_size
                     init_dur = _probe_duration(golden_preview)
-                    log.info(f"[COMMIT] ✅ Initialized golden_preview.mp4 from chunk_new.mp4: size={init_size} bytes, duration={init_dur}s")
+                    log.debug(f"[COMMIT] Initialized golden_preview.mp4 from chunk_new.mp4: size={init_size} bytes, duration={init_dur}s")
             else:
                 log.warning(f"[COMMIT] ❌ chunk_new.mp4 missing at {chunk_new}; falling back to rendering from golden")
                 seg_path = run_dir / "golden_segments" / f"{seed_idx+1:05d}_{end_idx:05d}.mp4"
@@ -2583,7 +2919,7 @@ def commit(run_id: str):
                         _ffmpeg_concat(golden_preview, seg_path, golden_preview, fps)
                     else:
                         golden_preview.write_bytes(seg_path.read_bytes())
-                    log.info(f"[COMMIT] ✅ Golden preview updated from rendered segment")
+                    log.debug(f"[COMMIT] Golden preview updated from rendered segment")
     except Exception as e:
         log.error(f"[COMMIT] ❌ Golden preview update failed (non-fatal): {e}", exc_info=True)
     
@@ -2608,58 +2944,71 @@ def get_frame_from_time(run_id: str, video_time: float):
     Get frame number from video playback time for tracked video.
     Returns relative frame number (relative to chunk start).
     """
-    import cv2
-    
     log.info(f"/get_frame_from_time run_id={run_id} video_time={video_time}")
     
     run_dir = RUNS_ROOT / run_id
-    meta_path = run_dir / "meta.txt"
-    if not meta_path.exists():
-        raise HTTPException(404, "run_id not found")
-    
-    meta = parse_meta_file(meta_path)
+    meta = parse_meta_file(run_dir / "meta.txt")
     source_fps = float(meta.get("fps", 30.0))
     
-    # Get tracked video path
-    tracked_video_path = run_dir / "tracked.mp4"
-    if not tracked_video_path.exists():
-        raise HTTPException(404, "Tracked video not found. Run /track first.")
-    
     # Get actual video properties
+    tracked_video_path = run_dir / "tracked.mp4"
     cap = cv2.VideoCapture(str(tracked_video_path))
-    if not cap.isOpened():
-        raise HTTPException(500, "Could not open tracked video")
-    
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     
-    log.info(f"[DEBUG] Video properties: fps={video_fps}, frame_count={video_frame_count}, source_fps={source_fps}")
-    log.info(f"[DEBUG] Video time: {video_time}s")
-    
     # Calculate relative frame from video time
-    # Use video's actual FPS if available, otherwise fallback to source FPS
-    if video_fps > 0:
-        relative_frame = int(video_time * video_fps)
-    else:
-        relative_frame = int(video_time * source_fps)
-    
-    # Clamp to valid range
+    relative_frame = int(video_time * video_fps)
     relative_frame = max(0, min(relative_frame, video_frame_count - 1))
     
     # Get last golden frame to calculate absolute frame
     processed, pct, max_idx = golden_progress(run_dir, int(meta["frames"]))
     absolute_frame = max_idx + relative_frame if max_idx is not None else relative_frame
     
-    log.info(f"[DEBUG] Calculated: relative_frame={relative_frame}, absolute_frame={absolute_frame}, max_idx={max_idx}")
-    
     return {
         "relative_frame": relative_frame,
         "absolute_frame": absolute_frame,
         "video_time": video_time,
-        "video_fps": float(video_fps) if video_fps > 0 else source_fps,
+        "video_fps": float(video_fps),
         "video_frame_count": video_frame_count,
     }
+
+
+@app.get("/track_progress/{run_id}")
+def get_track_progress(run_id: str):
+    """
+    Get progress for tracking operation.
+    Returns progress info if tracking is in progress, or None if completed/not found.
+    """
+    progress = track_progress.get(run_id)
+    if progress is None:
+        log.debug(f"[TRACK_PROGRESS] {run_id}: not found (not started yet or completed)")
+        # Return "not_started" instead of "completed" - frontend will keep polling
+        return {"status": "not_started", "progress": 0, "message": "Waiting to start..."}
+    
+    # Check if it's actually completed
+    if progress.get("stage") == "completed":
+        result = {
+            "status": "completed",
+            "stage": "completed",
+            "progress": 100,
+            "message": progress.get("message", "Completed"),
+            "current_frame": progress.get("current_frame"),
+            "total_frames": progress.get("total_frames"),
+        }
+        log.debug(f"[TRACK_PROGRESS] {run_id}: completed")
+        return result
+    
+    result = {
+        "status": "in_progress",
+        "stage": progress["stage"],
+        "progress": progress["progress"],
+        "message": progress["message"],
+        "current_frame": progress.get("current_frame"),
+        "total_frames": progress.get("total_frames"),
+    }
+    log.debug(f"[TRACK_PROGRESS] {run_id}: {progress['stage']} {progress['progress']}% - {progress['message']}")
+    return result
 
 
 @app.get("/progress/{run_id}")
@@ -2706,10 +3055,6 @@ def progress(run_id: str):
 
 @app.get("/frame0/{run_id}")
 def frame0(run_id: str):
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import Response
 
     jpeg0 = RUNS_ROOT / run_id / "xmem_generic" / "JPEGImages" / VIDEO_NAME / "00000.jpg"
     ann0  = RUNS_ROOT / run_id / "xmem_generic" / "Annotations" / VIDEO_NAME / "00000.png"
@@ -2725,16 +3070,12 @@ def frame0(run_id: str):
         labels = np.array(Image.open(ann0))
         max_id = int(labels.max())
 
-        def color_for(i: int):
-            rng = np.random.RandomState(i)
-            return tuple(int(x) for x in rng.randint(50, 255, size=3))
-
         for cid in range(1, max_id + 1):
             m = (labels == cid)
             if not m.any():
                 continue
 
-            col = color_for(cid)
+            col = get_color_for_id(cid)
             overlay = frame.copy()
             overlay[m] = col
             frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -2762,10 +3103,10 @@ def frame0(run_id: str):
                 thickness,
             )
 
+    # Encode frame to JPEG bytes for Response
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
         raise HTTPException(status_code=500, detail="failed to encode frame")
-
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
@@ -2775,10 +3116,6 @@ def get_tracked_frame(run_id: str, relative_frame_idx: int):
     Get a frame from the current tracked chunk by relative frame index.
     Returns frame image with mask overlays from the chunk.
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import Response
     
     log.info(f"/tracked_frame run_id={run_id} relative_frame_idx={relative_frame_idx}")
     
@@ -2813,9 +3150,7 @@ def get_tracked_frame(run_id: str, relative_frame_idx: int):
     if not frame_path.exists():
         raise HTTPException(404, f"Frame {absolute_frame} not found")
     
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {absolute_frame}")
+    frame = load_frame_safely(frame_path, frame_idx=absolute_frame)
     log.info(f"[TRACKED_FRAME] Frame image loaded: shape={frame.shape}")
     
     # Find tracked mask for this frame (search in golden and all chunks)
@@ -2830,10 +3165,6 @@ def get_tracked_frame(run_id: str, relative_frame_idx: int):
         unique_ids = [id for id in unique_ids if id > 0]  # Remove background
         log.info(f"[TRACKED_FRAME] Annotation contains {len(unique_ids)} object IDs: {unique_ids}, max_id={max_id}")
         
-        def color_for(i: int):
-            rng = np.random.RandomState(i)
-            return tuple(int(x) for x in rng.randint(50, 255, size=3))
-        
         rendered_count = 0
         for cid in range(1, max_id + 1):
             m = (labels == cid)
@@ -2843,7 +3174,7 @@ def get_tracked_frame(run_id: str, relative_frame_idx: int):
             mask_pixels = int(m.sum())
             log.info(f"[TRACKED_FRAME] Rendering mask for ID {cid} ({mask_pixels} pixels)")
             
-            col = color_for(cid)
+            col = get_color_for_id(cid)
             overlay = frame.copy()
             overlay[m] = col
             frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -2873,10 +3204,10 @@ def get_tracked_frame(run_id: str, relative_frame_idx: int):
     else:
         log.info(f"[TRACKED_FRAME] No annotation found for frame {absolute_frame} (path: {ann_path}, source: {ann_source})")
     
+    # Encode frame to JPEG bytes for Response
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
         raise HTTPException(status_code=500, detail="failed to encode frame")
-    
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
@@ -2886,10 +3217,6 @@ def get_frame(run_id: str, frame_idx: int):
     Get a specific frame with annotations (from golden or chunk).
     Returns frame image with mask overlays.
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import Response
 
     run_dir = RUNS_ROOT / run_id
     meta_path = run_dir / "meta.txt"
@@ -2910,12 +3237,10 @@ def get_frame(run_id: str, frame_idx: int):
     if not frame_path.exists():
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {frame_idx}")
+    frame = load_frame_safely(frame_path, frame_idx=frame_idx)
     
     # Try golden annotation first
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     ann_path = golden_ann_dir / f"{frame_idx:05d}.png"
     
     # If not in golden, try chunk
@@ -2941,16 +3266,12 @@ def get_frame(run_id: str, frame_idx: int):
         labels = np.array(Image.open(ann_path))
         max_id = int(labels.max())
         
-        def color_for(i: int):
-            rng = np.random.RandomState(i)
-            return tuple(int(x) for x in rng.randint(50, 255, size=3))
-        
         for cid in range(1, max_id + 1):
             m = (labels == cid)
             if not m.any():
                 continue
             
-            col = color_for(cid)
+            col = get_color_for_id(cid)
             overlay = frame.copy()
             overlay[m] = col
             frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -2978,10 +3299,10 @@ def get_frame(run_id: str, frame_idx: int):
                 thickness,
             )
     
+    # Encode frame to JPEG bytes for Response
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
         raise HTTPException(status_code=500, detail="failed to encode frame")
-    
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
@@ -2991,11 +3312,10 @@ def find_tracked_mask_for_frame(run_dir: Path, frame_idx: int) -> Tuple[Optional
     Searches in golden first, then in all chunks.
     Returns (annotation_path, source_description) or (None, "not found") if not found.
     """
-    from PIL import Image
     
     log.info(f"[FIND_MASK] Searching for tracked mask for frame {frame_idx}")
     
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     ann_path = golden_ann_dir / f"{frame_idx:05d}.png"
     
     if ann_path.exists():
@@ -3039,10 +3359,6 @@ def prepare_correction(run_id: str, frame_idx: int):
     3. Auto-assign IDs based on previous frame
     4. Return frame with masks, auto-assigned IDs, and list of existing IDs
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import JSONResponse
     
     log.info(f"/prepare_correction run_id={run_id} frame_idx={frame_idx}")
     
@@ -3073,60 +3389,206 @@ def prepare_correction(run_id: str, frame_idx: int):
     log.info(f"[DEBUG] Need to commit frames up to: {commit_up_to}, current max_idx: {max_idx}")
     
     # Define golden_ann_dir early (used later for getting existing IDs)
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     
     committed_count = 0
     if commit_up_to > max_idx:
-        # Need to commit more frames from the last chunk
+        # Use the same commit logic as /commit, but limit to commit_up_to (frame_idx - 1)
+        # Get last chunk info (needed for fallback, same as /commit)
         last_chunk_file = run_dir / "last_chunk.txt"
         last_chunk_meta = run_dir / "last_chunk_meta.txt"
-        
         if not last_chunk_file.exists() or not last_chunk_meta.exists():
             raise HTTPException(400, f"Cannot commit up to frame {commit_up_to}: no chunk available")
         
         chunk_root = Path(last_chunk_file.read_text(encoding="utf-8").strip())
         chunk_ann_dir = chunk_root / "Annotations" / VIDEO_NAME
+        
+        # Prefer deriving seed/end from the chunk folder name (same as /commit)
+        seed_idx = None
+        end_idx = None
+        try:
+            name = chunk_root.name
+            if "_" in name:
+                a, b = name.split("_", 1)
+                seed_idx = int(a)
+                end_idx = int(b)
+        except Exception:
+            seed_idx = None
+            end_idx = None
+        
         chunk_kv = dict(line.split("=", 1) for line in last_chunk_meta.read_text(encoding="utf-8").splitlines())
-        seed_idx = int(chunk_kv["seed_idx"])
-        end_idx = int(chunk_kv["end_idx"])
+        seed_idx_meta = int(chunk_kv["seed_idx"])
+        end_idx_meta = int(chunk_kv["end_idx"])
         
-        log.info(f"[DEBUG] Chunk info: seed_idx={seed_idx}, end_idx={end_idx}")
-        log.info(f"[DEBUG] Will commit frames: {seed_idx+1}..{min(commit_up_to, end_idx)}")
+        if seed_idx is None or end_idx is None:
+            seed_idx = seed_idx_meta
+            end_idx = end_idx_meta
         
-        ensure_dir(golden_ann_dir)  # golden_ann_dir already defined above
+        # Find all chunks that need to be committed (same logic as /commit)
+        chunks_dir = run_dir / "chunks"
+        all_chunks_to_commit = []
+        if chunks_dir.exists():
+            all_chunk_folders = sorted([f for f in chunks_dir.iterdir() if f.is_dir()])
+            
+            # Use commit_up_to as the limit (instead of end_idx in regular commit)
+            commit_end_limit = commit_up_to
+            
+            # Collect all candidate chunks first
+            candidate_chunks = []
+            for chunk_folder in all_chunk_folders:
+                try:
+                    name = chunk_folder.name
+                    if "_" in name:
+                        chunk_seed = int(name.split("_")[0])
+                        chunk_end = int(name.split("_")[1])
+                        # Include this chunk if:
+                        # - it overlaps with our commit range (max_idx+1..commit_up_to)
+                        # - AND it can fill at least one missing golden annotation in the overlapping range
+                        # A chunk overlaps if: chunk_seed+1 <= commit_up_to AND chunk_end >= max_idx+1
+                        overlaps_commit_range = (chunk_seed + 1) <= commit_up_to and chunk_end >= (max_idx + 1)
+                        has_missing = False
+                        if overlaps_commit_range:
+                            # Check for missing frames only in the range we actually want to commit: (max_idx+1)..commit_up_to
+                            check_start = max(chunk_seed + 1, max_idx + 1)
+                            check_end = min(chunk_end, commit_up_to)
+                            for gi in range(check_start, check_end + 1):
+                                if not (golden_ann_dir / f"{gi:05d}.png").exists():
+                                    has_missing = True
+                                    break
+                        should_include = overlaps_commit_range and has_missing
+                        log.info(f"[PREPARE_CORRECTION] Chunk {name}: seed={chunk_seed}, end={chunk_end}, max_idx={max_idx}, commit_up_to={commit_up_to}, overlaps={overlaps_commit_range}, has_missing={has_missing}, include={should_include}")
+                        if should_include:
+                            candidate_chunks.append((chunk_seed, chunk_end, chunk_folder))
+                except (ValueError, IndexError) as e:
+                    log.warning(f"[PREPARE_CORRECTION] Failed to parse chunk folder {chunk_folder.name}: {e}")
+                    continue
+            
+            # Sort chunks by seed descending (newest first) to prefer newer tracking over older
+            # This ensures that when multiple chunks cover the same frame range, we use the newest one
+            candidate_chunks.sort(key=lambda x: x[0], reverse=True)
+            all_chunks_to_commit = candidate_chunks
         
-        # Also copy JPEG frames
-        golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+        # If we found chunks, commit them all; otherwise fall back to the last chunk (same as /commit)
+        if len(all_chunks_to_commit) > 0:
+            log.info(f"[PREPARE_CORRECTION] Found {len(all_chunks_to_commit)} chunks to commit (sorted newest first)")
+        else:
+            all_chunks_to_commit = [(seed_idx, end_idx, chunk_root)]
+        
+        # Commit NEW frames only: seed+1..end (same as /commit)
+        golden_jpeg_dir = get_golden_jpeg_dir(run_dir)
         ensure_dir(golden_jpeg_dir)
+        
         src_root = run_dir / "xmem_generic"
         src_jpeg = src_root / "JPEGImages" / VIDEO_NAME
         
-        # Commit frames seed+1..min(commit_up_to, end_idx)
-        # Don't commit beyond what's in the chunk
-        commit_end = min(commit_up_to, end_idx)
         committed = 0
-        for orig_idx in range(seed_idx + 1, commit_end + 1):
-            rel = orig_idx - seed_idx
-            src = chunk_ann_dir / f"{rel:05d}.png"
-            if not src.exists():
-                log.warning(f"Missing chunk mask for frame {orig_idx} (relative {rel}), skipping")
+        skipped_corrected = 0
+        
+        # Commit all chunks (same logic as /commit)
+        for chunk_seed, chunk_end, chunk_folder in all_chunks_to_commit:
+            chunk_ann_dir_this = chunk_folder / "Annotations" / VIDEO_NAME
+            if not chunk_ann_dir_this.exists():
+                log.warning(f"[PREPARE_CORRECTION] Skipping chunk {chunk_folder.name} - annotations missing")
                 continue
-            dst = golden_ann_dir / f"{orig_idx:05d}.png"
-            shutil.copy2(src, dst)
             
-            # Also copy JPEG frame
-            src_jpeg_frame = src_jpeg / f"{orig_idx:05d}.jpg"
-            if src_jpeg_frame.exists():
-                dst_jpeg_frame = golden_jpeg_dir / f"{orig_idx:05d}.jpg"
-                shutil.copy2(src_jpeg_frame, dst_jpeg_frame)
+            log.info(f"[PREPARE_CORRECTION] Processing chunk {chunk_folder.name}: seed={chunk_seed}, end={chunk_end}")
             
-            committed += 1
+            # Determine actual range for this chunk: only commit frames from max_idx+1 to commit_up_to
+            # We don't limit based on corrected frames here - we'll skip corrected frames individually during processing
+            # This ensures we don't create gaps (e.g., if frame 199 is corrected, we still process frames 200-230)
+            chunk_commit_start = max(chunk_seed + 1, max_idx + 1)
+            chunk_commit_end = min(commit_up_to, chunk_end)
+            log.info(f"[PREPARE_CORRECTION] Chunk {chunk_folder.name}: will commit frames {chunk_commit_start}..{chunk_commit_end} (out of chunk range {chunk_seed}..{chunk_end}, max_idx={max_idx})")
+            
+            # Skip this chunk if there's no overlap with the commit range
+            if chunk_commit_start > chunk_commit_end:
+                log.info(f"[PREPARE_CORRECTION] Chunk {chunk_folder.name}: skipping (no frames in range {max_idx+1}..{commit_up_to})")
+                continue
+            
+            # First, check if the seed frame exists in golden - if not, copy it (same as /commit)
+            # But only if seed frame is >= max_idx (we don't want to copy old seed frames)
+            if chunk_seed >= max_idx:
+                seed_mask_src = chunk_ann_dir_this / "00000.png"
+                seed_mask_dst = golden_ann_dir / f"{chunk_seed:05d}.png"
+                if seed_mask_src.exists() and not seed_mask_dst.exists():
+                    log.debug(f"[PREPARE_CORRECTION] Seed frame {chunk_seed} not in golden, copying it")
+                    shutil.copy2(seed_mask_src, seed_mask_dst)
+                    # Also copy JPEG frame
+                    seed_jpeg_src = src_jpeg / f"{chunk_seed:05d}.jpg"
+                    if seed_jpeg_src.exists():
+                        seed_jpeg_dst = golden_jpeg_dir / f"{chunk_seed:05d}.jpg"
+                        shutil.copy2(seed_jpeg_src, seed_jpeg_dst)
+                    committed += 1
+            
+            # Commit frames from this chunk: chunk_commit_start to chunk_commit_end
+            files_to_copy = []
+            jpeg_files_to_copy = []
+            chunk_committed_frames = []
+            
+            for orig_idx in range(chunk_commit_start, chunk_commit_end + 1):
+                rel = orig_idx - chunk_seed
+                src = chunk_ann_dir_this / f"{rel:05d}.png"
+                
+                if not src.exists():
+                    log.warning(f"[PREPARE_CORRECTION] Missing chunk mask for frame {orig_idx} (relative {rel}) - reached end of chunk, stopping")
+                    break
+                
+                dst = golden_ann_dir / f"{orig_idx:05d}.png"
+                
+                # Check if this frame already has a corrected mask in golden (same as /commit)
+                if dst.exists():
+                    existing_mask = np.array(Image.open(dst))
+                    chunk_mask = np.array(Image.open(src))
+                    
+                    if existing_mask.shape != chunk_mask.shape:
+                        log.error(f"[PREPARE_CORRECTION] ⚠️  DIMENSION MISMATCH for frame {orig_idx}! Existing: {existing_mask.shape}, Chunk: {chunk_mask.shape}")
+                        continue
+                    
+                    masks_different = not np.array_equal(existing_mask, chunk_mask)
+                    if masks_different:
+                        log.info(f"[PREPARE_CORRECTION] Frame {orig_idx} has corrected mask in golden (differs from chunk), skipping overwrite")
+                        skipped_corrected += 1
+                    else:
+                        files_to_copy.append((src, dst))
+                        chunk_committed_frames.append(orig_idx)
+                else:
+                    files_to_copy.append((src, dst))
+                    chunk_committed_frames.append(orig_idx)
+                
+                # Always collect JPEG frame for copying
+                src_jpeg_frame = src_jpeg / f"{orig_idx:05d}.jpg"
+                if src_jpeg_frame.exists():
+                    dst_jpeg_frame = golden_jpeg_dir / f"{orig_idx:05d}.jpg"
+                    jpeg_files_to_copy.append((src_jpeg_frame, dst_jpeg_frame))
+            
+            # Copy all files in parallel (same as /commit)
+            if files_to_copy:
+                copied_count = copy_files_parallel(files_to_copy, max_workers=8)
+                committed += copied_count
+                if chunk_committed_frames:
+                    first_frame = min(chunk_committed_frames)
+                    last_frame = max(chunk_committed_frames)
+                    log.info(f"[PREPARE_CORRECTION] Chunk {chunk_folder.name}: committed {copied_count} frames ({first_frame}..{last_frame})")
+                else:
+                    log.debug(f"[PREPARE_CORRECTION] Copied {copied_count} mask files in parallel")
+            
+            if jpeg_files_to_copy:
+                copy_files_parallel(jpeg_files_to_copy, max_workers=8)
+                log.debug(f"[PREPARE_CORRECTION] Copied {len(jpeg_files_to_copy)} JPEG files in parallel")
+        
+        # Calculate actual committed range (same format as /commit)
+        if all_chunks_to_commit:
+            first_chunk_seed = all_chunks_to_commit[0][0]
+            last_chunk_end = min(commit_up_to, all_chunks_to_commit[-1][1])
+            committed_range = f"{first_chunk_seed+1}..{last_chunk_end}"
+        else:
+            committed_range = f"{seed_idx+1}..{min(commit_up_to, end_idx)}"
         
         committed_count = committed
-        log.info(f"✅ Committed {committed} frames to golden: {seed_idx+1}..{commit_end}")
-        
-        if commit_up_to > end_idx:
-            log.warning(f"⚠️  Requested commit up to frame {commit_up_to}, but chunk only goes to {end_idx}. Committed {seed_idx+1}..{end_idx}")
+        log.info(f"[PREPARE_CORRECTION] Commit complete:")
+        log.info(f"[PREPARE_CORRECTION]   Committed {committed} NEW frames to golden: {golden_ann_dir} ({committed_range})")
+        if skipped_corrected > 0:
+            log.info(f"[PREPARE_CORRECTION]   Skipped {skipped_corrected} frames that had corrected masks in golden")
         
         # Update golden preview video for committed frames
         # Extract from tracked.mp4 instead of rendering from golden (tracked video already has correct masks)
@@ -3134,44 +3596,83 @@ def prepare_correction(run_id: str, frame_idx: int):
             golden_preview = run_dir / "golden" / "golden_preview.mp4"
             tracked_path = run_dir / "tracked.mp4"
             
-            if commit_end >= seed_idx + 1 and committed_count > 0 and tracked_path.exists():
-                log.info(f"[PREPARE_CORRECTION] Extracting tracked segment {seed_idx+1}..{commit_end} from tracked.mp4")
-                # Extract frames from tracked.mp4: frames seed+1..commit_end
-                # tracked.mp4 contains frames seed..end_idx (seed is frame 0 in the video)
-                # We want frames 1..(commit_end-seed_idx) from tracked.mp4
-                tracked_seg_start = 1  # Skip seed frame (frame 0 in video)
-                tracked_seg_end = commit_end - seed_idx  # Last frame to include
-                seg_path = run_dir / "golden_segments" / f"tracked_{seed_idx+1}_{commit_end}.mp4"
-                ensure_dir(seg_path.parent)
+            log.info(f"[PREPARE_CORRECTION] Video update check: committed_count={committed_count}, tracked_path.exists()={tracked_path.exists() if tracked_path else False}")
+            log.info(f"[PREPARE_CORRECTION] Video update check: max_idx={max_idx}, commit_up_to={commit_up_to}")
+            log.info(f"[PREPARE_CORRECTION] Video update check: all_chunks_to_commit count={len(all_chunks_to_commit) if all_chunks_to_commit else 0}")
+            if all_chunks_to_commit:
+                log.info(f"[PREPARE_CORRECTION] Video update check: first chunk={all_chunks_to_commit[0]}, last chunk={all_chunks_to_commit[-1]}")
+            log.info(f"[PREPARE_CORRECTION] Video update check: seed_idx={seed_idx}, end_idx={end_idx}")
+            
+            # tracked.mp4 contains the full tracked video from the most recent tracking session
+            # tracked.mp4 frame 0 = seed_idx (from last_chunk_meta.txt, where the tracking session started)
+            # This is the max_idx at the time of tracking, which is where tracked.mp4 starts
+            tracked_video_seed = seed_idx  # This is the seed of the tracking session that created tracked.mp4
+            
+            log.info(f"[PREPARE_CORRECTION] tracked.mp4 was created from tracking session starting at seed_idx={tracked_video_seed}")
+            log.info(f"[PREPARE_CORRECTION] tracked.mp4 frame 0 = absolute frame {tracked_video_seed}")
+            log.info(f"[PREPARE_CORRECTION] Current max_idx={max_idx}, commit_up_to={commit_up_to}")
+            
+            # We need to extract frames from max_idx+1 to commit_up_to
+            # tracked.mp4 frame 0 = seed_idx (which equals max_idx when tracking started)
+            # So we extract frames 1..(commit_up_to - max_idx) from tracked.mp4
+            # This gives us absolute frames (max_idx+1)..commit_up_to
+            if committed_count > 0 and tracked_path.exists():
+                # Extract frames 1..(commit_up_to - max_idx) from tracked.mp4
+                # This gives us exactly (commit_up_to - max_idx) frames: absolute frames (max_idx+1)..commit_up_to
+                tracked_seg_start = 1  # Skip seed frame (frame 0 in tracked.mp4)
+                tracked_seg_end = commit_up_to - max_idx  # Number of frames to extract
                 
-                # Extract frames using ffmpeg
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(tracked_path),
-                    "-vf", f"select='gte(n,{tracked_seg_start})*lt(n,{tracked_seg_end+1})',setpts=N/({fps:.10f}*TB)",
-                    "-r", f"{fps:.10f}",
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "20",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    str(seg_path),
-                ]
-                log.info(f"[PREPARE_CORRECTION] Running: {' '.join(cmd)}")
-                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                log.info(f"[PREPARE_CORRECTION] Video extraction calculation:")
+                log.info(f"[PREPARE_CORRECTION]   max_idx={max_idx}, commit_up_to={commit_up_to}")
+                log.info(f"[PREPARE_CORRECTION]   tracked.mp4 frame 0 = absolute frame {tracked_video_seed} (should equal max_idx={max_idx})")
+                log.info(f"[PREPARE_CORRECTION]   Extracting tracked.mp4 frames {tracked_seg_start}..{tracked_seg_end}")
+                log.info(f"[PREPARE_CORRECTION]   This gives absolute frames {max_idx+1}..{commit_up_to} ({tracked_seg_end} frames)")
                 
-                if p.returncode == 0 and seg_path.exists():
-                    log.info(f"[PREPARE_CORRECTION] ✅ Extracted tracked segment: {seg_path}")
-                    # Append to golden preview
-                    if golden_preview.exists():
-                        _ffmpeg_concat(golden_preview, seg_path, golden_preview, fps)
+                if tracked_seg_end >= tracked_seg_start and tracked_seg_start >= 0:
+                    log.info(f"[PREPARE_CORRECTION] ✅ Range is valid, proceeding with extraction")
+                    seg_path = run_dir / "golden_segments" / f"tracked_{max_idx+1}_{commit_up_to}.mp4"
+                    ensure_dir(seg_path.parent)
+                    
+                    # Extract frames using ffmpeg
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(tracked_path),
+                        "-vf", f"select='gte(n,{tracked_seg_start})*lt(n,{tracked_seg_end+1})',setpts=N/({fps:.10f}*TB)",
+                        "-r", f"{fps:.10f}",
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                        "-crf", "20",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        str(seg_path),
+                    ]
+                    log.info(f"[PREPARE_CORRECTION] Running ffmpeg extraction: {' '.join(cmd)}")
+                    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    
+                    if p.returncode == 0 and seg_path.exists():
+                        seg_size = seg_path.stat().st_size
+                        log.info(f"[PREPARE_CORRECTION] ✅ Extracted tracked segment: {seg_path} (size={seg_size} bytes)")
+                        # Append to golden preview
+                        if golden_preview.exists():
+                            golden_preview_size_before = golden_preview.stat().st_size
+                            log.info(f"[PREPARE_CORRECTION] Appending to existing golden preview (size={golden_preview_size_before} bytes)")
+                            _ffmpeg_concat(golden_preview, seg_path, golden_preview, fps)
+                            golden_preview_size_after = golden_preview.stat().st_size
+                            log.info(f"[PREPARE_CORRECTION] ✅ Updated golden preview video: {max_idx+1}..{commit_up_to} (size before={golden_preview_size_before}, after={golden_preview_size_after})")
+                        else:
+                            golden_preview.write_bytes(seg_path.read_bytes())
+                            golden_preview_size = golden_preview.stat().st_size
+                            log.info(f"[PREPARE_CORRECTION] ✅ Initialized golden preview video: {max_idx+1}..{commit_up_to} (size={golden_preview_size} bytes)")
                     else:
-                        golden_preview.write_bytes(seg_path.read_bytes())
-                    log.info(f"[PREPARE_CORRECTION] ✅ Updated golden preview video with tracked frames {seed_idx+1}..{commit_end}")
+                        log.error(f"[PREPARE_CORRECTION] ❌ Failed to extract tracked segment (returncode={p.returncode}): {p.stdout[-500:] if p.stdout else 'no output'}")
                 else:
-                    log.error(f"[PREPARE_CORRECTION] Failed to extract tracked segment: {p.stdout[-500:] if p.stdout else 'no output'}")
+                    log.warning(f"[PREPARE_CORRECTION] ⚠️  Invalid range: tracked_seg_start={tracked_seg_start}, tracked_seg_end={tracked_seg_end}")
+                    log.warning(f"[PREPARE_CORRECTION] ⚠️  Conditions: tracked_seg_end >= tracked_seg_start = {tracked_seg_end >= tracked_seg_start}, tracked_seg_start >= 0 = {tracked_seg_start >= 0}")
+                    log.warning(f"[PREPARE_CORRECTION] ⚠️  This means we cannot extract {commit_up_to - max_idx} frames from tracked.mp4")
             elif not tracked_path.exists():
-                log.warning(f"[PREPARE_CORRECTION] tracked.mp4 not found, cannot update golden preview video")
+                log.warning(f"[PREPARE_CORRECTION] tracked.mp4 not found at {tracked_path}, cannot update golden preview video")
+            elif committed_count == 0:
+                log.info(f"[PREPARE_CORRECTION] No committed frames (committed_count=0), skipping video update")
         except Exception as e:
             log.warning(f"[PREPARE_CORRECTION] Failed to update golden preview video (non-fatal): {e}", exc_info=True)
     
@@ -3189,7 +3690,8 @@ def prepare_correction(run_id: str, frame_idx: int):
     log.info(f"[PREPARE_CORRECTION] SAM-3 found {len(new_masks)} masks for frame {frame_idx}")
     
     # Save masks temporarily for refinement
-    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    masks_file = get_correction_masks_file(run_dir, frame_idx)
+    masks_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(masks_file, new_masks)
     log.info(f"[PREPARE_CORRECTION] Saved {len(new_masks)} masks to {masks_file} for refinement")
     
@@ -3230,7 +3732,8 @@ def prepare_correction(run_id: str, frame_idx: int):
     log.info(f"[PREPARE_CORRECTION] Assignments: {assignments}")
     
     # Save assignments for use during refinement (to preserve IDs)
-    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    assignments_file = get_correction_assignments_file(run_dir, frame_idx)
+    assignments_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(assignments_file, assignments)
     log.info(f"[PREPARE_CORRECTION] Saved ID assignments to {assignments_file} for refinement")
     
@@ -3243,14 +3746,8 @@ def prepare_correction(run_id: str, frame_idx: int):
     
     # Create preview image showing tracked masks (if frame was already processed) and new SAM masks
     log.info(f"[PREPARE_CORRECTION] Creating preview image for frame {frame_idx}")
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {frame_idx}")
+    frame = load_frame_safely(frame_path, frame_idx=frame_idx)
     log.info(f"[PREPARE_CORRECTION] Frame image loaded: shape={frame.shape}")
-    
-    def color_for(i: int):
-        rng = np.random.RandomState(i)
-        return tuple(int(x) for x in rng.randint(50, 255, size=3))
     
     # First, render tracked masks (if frame was already processed) with lower opacity
     # Use the tracked_label_map we found earlier
@@ -3265,7 +3762,7 @@ def prepare_correction(run_id: str, frame_idx: int):
             if not tracked_mask.any():
                 continue
             rendered_tracked_count += 1
-            col = color_for(obj_id)
+            col = get_color_for_id(obj_id)
             overlay = frame.copy()
             overlay[tracked_mask] = col
             frame = cv2.addWeighted(frame, 0.85, overlay, 0.15, 0)  # Very subtle overlay for tracked masks
@@ -3301,15 +3798,14 @@ def prepare_correction(run_id: str, frame_idx: int):
         mask = new_masks[mask_idx]
         mask_pixels = int(mask.sum())
         log.info(f"[PREPARE_CORRECTION] Rendering SAM mask {mask_idx} -> ID {assigned_id} ({mask_pixels} pixels)")
-        col = color_for(assigned_id)
+        col = get_color_for_id(assigned_id, min_val=0)
         overlay = frame.copy()
         overlay[mask] = col
         frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)  # More prominent overlay for new masks
         
         ys, xs = np.where(mask)
         if len(ys) == 0:
-            log.warning(f"[PREPARE_CORRECTION] Mask {mask_idx} has no pixels!")
-            continue
+            continue  # Skip empty masks
         cx, cy = int(xs.mean()), int(ys.mean())
         
         text = str(assigned_id)
@@ -3332,9 +3828,7 @@ def prepare_correction(run_id: str, frame_idx: int):
         )
     log.info(f"[PREPARE_CORRECTION] Preview rendering complete for frame {frame_idx}")
     
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
+    # Frame encoding handled by encode_frame_to_base64 if needed
     
     # Prepare response
     mask_assignments = [
@@ -3346,8 +3840,7 @@ def prepare_correction(run_id: str, frame_idx: int):
         for mask_idx, assigned_id in sorted(assignments.items())
     ]
     
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    image_b64 = encode_frame_to_base64(frame, quality=90)
     
     # Get image dimensions for coordinate scaling
     img_height, img_width = frame.shape[:2]
@@ -3381,12 +3874,6 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
     Add a new mask using a point prompt with SAM-3 video predictor (1-frame video session).
     This creates a new mask from scratch using a positive point prompt.
     """
-    import numpy as np
-    import cv2
-    import tempfile
-    import shutil
-    from PIL import Image
-    from fastapi.responses import JSONResponse
     from sam3.visualization_utils import prepare_masks_for_visualization
     
     log.info(f"[ADD_MASK] ========== ADD NEW MASK ==========")
@@ -3397,14 +3884,9 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
         raise HTTPException(404, f"Run not found: {run_id}")
     
     # Load existing masks from prepare_correction (or create empty array if none exist)
-    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    masks_file = get_correction_masks_file(run_dir, frame_idx)
     if masks_file.exists():
-        masks_raw = np.load(masks_file, allow_pickle=True)
-        # Convert to list and ensure each mask is a numpy array
-        if isinstance(masks_raw, np.ndarray):
-            masks = [m if isinstance(m, np.ndarray) else np.array(m) for m in masks_raw]
-        else:
-            masks = [np.array(m) if not isinstance(m, np.ndarray) else m for m in masks_raw]
+        masks = load_masks_safely(masks_file)
         log.info(f"[ADD_MASK] Loaded {len(masks)} existing masks from {masks_file}")
         for i, m in enumerate(masks[:3]):  # Log first 3 masks
             log.info(f"[ADD_MASK]   Mask {i}: type={type(m)}, dtype={getattr(m, 'dtype', 'N/A')}, shape={getattr(m, 'shape', 'N/A')}")
@@ -3413,15 +3895,10 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
         log.info(f"[ADD_MASK] No existing masks found, starting with empty list")
     
     # Load ID assignments to identify deleted masks (ID <= 0 or missing from assignments)
-    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    assignments_file = get_correction_assignments_file(run_dir, frame_idx)
     id_assignments = {}
-    if assignments_file.exists():
-        id_assignments = np.load(assignments_file, allow_pickle=True).item()
-        log.info(f"[ADD_MASK] Loaded ID assignments: {id_assignments}")
-    else:
-        # If no assignments file, create default (all masks have valid IDs)
-        id_assignments = {i: i + 1 for i in range(len(masks))}
-        log.info(f"[ADD_MASK] No assignments file found, using default assignments: {id_assignments}")
+    id_assignments = load_assignments_or_default(assignments_file, len(masks))
+    log.info(f"[ADD_MASK] Using ID assignments: {id_assignments}")
     
     # Identify which masks are deleted:
     # 1. Masks with ID <= 0 in assignments
@@ -3462,7 +3939,6 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
     tmpdir = tempfile.mkdtemp(prefix="sam3_add_mask_")
     try:
         # Load image and save as JPEG
-        import cv2
         img = Image.open(frame_path).convert("RGB")
         image_np = np.array(img)
         frame_tmp_path = Path(tmpdir) / "00000.jpg"
@@ -3746,9 +4222,15 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
     new_mask_index = len(masks)
     masks.append(new_mask)
     
+    # Validate we're working with the correct frame
+    log.info(f"[ADD_MASK] Saving masks with new mask for frame {frame_idx} to {masks_file}")
+    log.info(f"[ADD_MASK] File path validation: expected frame_idx={frame_idx}, file contains 'correction_masks_{frame_idx}'")
+    if f"correction_masks_{frame_idx}" not in str(masks_file):
+        log.error(f"[ADD_MASK] ⚠️  FRAME INDEX MISMATCH! frame_idx={frame_idx} but file path is {masks_file}")
+    
     # Save all masks (including deleted ones) to preserve original indices
     np.save(masks_file, np.array(masks, dtype=object))
-    log.info(f"[ADD_MASK] Added new mask at index {new_mask_index}. Total masks: {len(masks)} (including {len(deleted_mask_indices)} deleted)")
+    log.info(f"[ADD_MASK] ✓ Saved masks for frame {frame_idx} to {masks_file} (added new mask at index {new_mask_index}, total masks: {len(masks)})")
     
     # Update assignments: keep all original assignments, add new mask
     assignments = id_assignments.copy()
@@ -3762,18 +4244,13 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
     log.info(f"[ADD_MASK] Assigned new mask (index={new_mask_index}) to ID {new_id} (max existing was {max_existing_id})")
     
     # Save updated assignments (keeping deleted masks with ID <= 0, adding new mask)
-    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    assignments_file = get_correction_assignments_file(run_dir, frame_idx)
+    assignments_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(assignments_file, assignments)
     log.info(f"[ADD_MASK] Saved updated assignments to {assignments_file}")
     
     # Render preview image with all masks (including new one)
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {frame_idx}")
-    
-    def color_for(i: int):
-        rng = np.random.RandomState(i)
-        return tuple(int(x) for x in rng.randint(50, 255, size=3))
+    frame = load_frame_safely(frame_path, frame_idx=frame_idx)
     
     # Render all masks (skip deleted ones)
     for mask_idx, mask in enumerate(masks):
@@ -3781,15 +4258,7 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
         if mask_idx in deleted_mask_indices:
             continue
         
-        # Ensure mask is a numpy array (might be list from file)
-        if not isinstance(mask, np.ndarray):
-            log.warning(f"[ADD_MASK] Mask {mask_idx} is not a numpy array (type={type(mask)}), converting...")
-            mask = np.array(mask)
-        
-        # Ensure mask is boolean for indexing
-        if mask.dtype != bool:
-            mask = (mask > 0.5).astype(bool)
-        
+        # Mask is already validated as boolean array by load_masks_safely()
         log.debug(f"[ADD_MASK] Rendering mask {mask_idx}: dtype={mask.dtype}, shape={mask.shape}, size={int(mask.sum())}px")
         
         assigned_id = assignments.get(mask_idx, mask_idx + 1)
@@ -3801,7 +4270,7 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
             overlay[mask] = col
             frame = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
         else:
-            col = color_for(assigned_id)
+            col = get_color_for_id(assigned_id, min_val=0)
             overlay = frame.copy()
             overlay[mask] = col
             frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
@@ -3817,12 +4286,7 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
     cv2.circle(frame, (add_request.point.x, add_request.point.y), 8, (255, 255, 255), 2)
     
     # Encode preview image
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
-    
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    image_b64 = encode_frame_to_base64(frame, quality=90)
     
     log.info(f"[ADD_MASK] ========== NEW MASK ADDED ==========")
     log.info(f"[ADD_MASK] New mask size: {new_mask_size}px")
@@ -3858,12 +4322,6 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     This follows the same approach as testing_backend.py: create a 1-frame video session,
     establish the mask as an object, then add point prompts to refine it.
     """
-    import numpy as np
-    import cv2
-    import tempfile
-    import shutil
-    from PIL import Image
-    from fastapi.responses import JSONResponse
     from sam3.visualization_utils import prepare_masks_for_visualization
     
     log.info(f"[REFINE_MASK] ========== START REFINEMENT ==========")
@@ -3874,21 +4332,8 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
         raise HTTPException(404, f"Run not found: {run_id}")
     
     # Load saved masks from prepare_correction
-    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
-    if not masks_file.exists():
-        raise HTTPException(400, f"Masks not found. Please run prepare_correction first.")
-    
-    loaded_masks = np.load(masks_file, allow_pickle=True)
-    # Ensure all loaded masks are numpy arrays and boolean
-    masks = []
-    for i, m in enumerate(loaded_masks):
-        if not isinstance(m, np.ndarray):
-            log.warning(f"[REFINE_MASK] Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
-            m = np.asarray(m)
-        if m.dtype != bool:
-            log.warning(f"[REFINE_MASK] Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
-            m = (m > 0.5).astype(bool)
-        masks.append(m)
+    masks_file = get_correction_masks_file(run_dir, frame_idx)
+    masks = load_masks_safely(masks_file)  # Will raise FileNotFoundError if missing
     log.info(f"[REFINE_MASK] Loaded {len(masks)} masks from {masks_file}")
     if refine_request.mask_index >= len(masks):
         raise HTTPException(400, f"Invalid mask_index {refine_request.mask_index} (max: {len(masks)-1})")
@@ -3929,7 +4374,6 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     tmpdir = tempfile.mkdtemp(prefix="sam3_refine_")
     try:
         # Load image and save as JPEG (exactly like testing_backend.py start_single_image_session)
-        import cv2
         img = Image.open(frame_path).convert("RGB")
         image_np = np.array(img)
         frame_tmp_path = Path(tmpdir) / "00000.jpg"
@@ -4208,6 +4652,8 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
             
             # Use the original mask (don't update it)
             refined_mask = current_mask.copy()
+            # Ensure mask is boolean for indexing operations
+            refined_mask = refined_mask.astype(bool) if refined_mask.dtype != bool else refined_mask
             refined_mask_size = original_mask_size
             size_change = 0
             size_change_pct = 0.0
@@ -4222,7 +4668,8 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
             # Get refined mask (exactly like testing_backend.py - uses safe_mask_hw)
             log.info(f"[REFINE_MASK] Step 7: Extracting refined mask...")
             mask = safe_mask_hw(np.asarray(found["mask"]), H, W)
-            refined_mask = mask
+            # Ensure mask is boolean for indexing operations
+            refined_mask = mask.astype(bool) if mask.dtype != bool else mask
             refined_mask_size = int(refined_mask.sum())
             size_change = refined_mask_size - original_mask_size
             size_change_pct = (size_change / original_mask_size * 100) if original_mask_size > 0 else 0
@@ -4251,40 +4698,28 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
     
     # Reload original masks to ensure we don't accidentally modify other masks
     # This ensures we only update the specific mask being refined
-    original_loaded_masks = np.load(masks_file, allow_pickle=True)
-    original_masks = []
-    for i, m in enumerate(original_loaded_masks):
-        if not isinstance(m, np.ndarray):
-            m = np.asarray(m)
-        if m.dtype != bool:
-            m = (m > 0.5).astype(bool)
-        original_masks.append(m)
+    original_masks = load_masks_safely(masks_file)
+    
+    # Validate we're working with the correct frame
+    log.info(f"[REFINE_MASK] Saving refined masks for frame {frame_idx} to {masks_file}")
+    log.info(f"[REFINE_MASK] File path validation: expected frame_idx={frame_idx}, file contains 'correction_masks_{frame_idx}'")
+    if f"correction_masks_{frame_idx}" not in str(masks_file):
+        log.error(f"[REFINE_MASK] ⚠️  FRAME INDEX MISMATCH! frame_idx={frame_idx} but file path is {masks_file}")
     
     # Only update the specific mask being refined - preserve all others exactly as they were
     original_masks[refine_request.mask_index] = refined_mask
     
     # Save updated masks (only the refined mask changed, all others are preserved)
     np.save(masks_file, np.array(original_masks, dtype=object))
-    log.info(f"[REFINE_MASK] Updated only mask {refine_request.mask_index}, preserved all other masks unchanged")
+    log.info(f"[REFINE_MASK] ✓ Saved refined masks for frame {frame_idx} to {masks_file} (updated mask {refine_request.mask_index}, preserved all other masks unchanged)")
     
     # Load ID assignments from prepare_correction to preserve IDs
-    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
-    if assignments_file.exists():
-        assignments = np.load(assignments_file, allow_pickle=True).item()
-        log.info(f"[REFINE_MASK] Loaded ID assignments: {assignments}")
-    else:
-        # Fallback: create default assignments (mask_idx -> mask_idx + 1)
-        assignments = {i: i + 1 for i in range(len(masks))}
-        log.warning(f"[REFINE_MASK] Assignments file not found, using default: {assignments}")
+    assignments_file = get_correction_assignments_file(run_dir, frame_idx)
+    assignments = load_assignments_or_default(assignments_file, len(masks))
+    log.info(f"[REFINE_MASK] Using ID assignments: {assignments}")
     
     # Re-render preview image with refined mask, using preserved ID assignments
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {frame_idx}")
-    
-    def color_for(i: int):
-        rng = np.random.RandomState(i)
-        return tuple(int(x) for x in rng.randint(50, 255, size=3))
+    frame = load_frame_safely(frame_path, frame_idx=frame_idx)
     
     # Render all masks (with refined one) using preserved ID assignments
     # Skip deleted masks (ID <= 0 or missing from assignments) - only render active masks
@@ -4299,28 +4734,22 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
             # Skip deleted masks (ID <= 0)
             continue
         
-        # Ensure mask is boolean for indexing
-        if not isinstance(mask, np.ndarray):
-            log.warning(f"[REFINE_MASK] Mask {mask_idx} is not a numpy array (type: {type(mask)}), converting for rendering.")
-            mask = np.asarray(mask)
-        if mask.dtype != bool:
-            log.warning(f"[REFINE_MASK] Mask {mask_idx} is not boolean (dtype: {mask.dtype}), converting for rendering.")
-            mask = (mask > 0.5).astype(bool)
-        
+        # Ensure mask is boolean for indexing operations
+        mask_bool = mask.astype(bool) if mask.dtype != bool else mask
         if mask_idx == refine_request.mask_index:
             # Highlight the refined mask
             col = (0, 255, 0)  # Green for refined mask
             overlay = frame.copy()
-            overlay[mask] = col
+            overlay[mask_bool] = col
             frame = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
         else:
-            col = color_for(assigned_id)  # Use assigned ID for color consistency
+            col = get_color_for_id(assigned_id, min_val=0)  # Use assigned ID for color consistency
             overlay = frame.copy()
-            overlay[mask] = col
+            overlay[mask_bool] = col
             frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
         
         # Draw mask center with assigned ID (not mask index)
-        ys, xs = np.where(mask)
+        ys, xs = np.where(mask_bool)
         if len(ys) > 0:
             cx, cy = int(xs.mean()), int(ys.mean())
             cv2.putText(frame, str(assigned_id), (cx-10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -4332,12 +4761,7 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
         cv2.circle(frame, (p.x, p.y), 8, (255, 255, 255), 2)
     
     # Encode preview image
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
-    
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    image_b64 = encode_frame_to_base64(frame, quality=90)
     
     log.info(f"[REFINE_MASK] Mask {refine_request.mask_index} refined, new size: {int(refined_mask.sum())} pixels")
     
@@ -4364,10 +4788,6 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
     Regenerate preview image with current ID mappings and deletions.
     Used for real-time preview updates as user edits the table.
     """
-    import numpy as np
-    import cv2
-    from PIL import Image
-    from fastapi.responses import JSONResponse
     
     log.info(f"/preview_correction_update run_id={run_id} frame_idx={frame_idx}")
     log.info(f"Preview update mapping: {preview_update.mapping}")
@@ -4389,20 +4809,10 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
     # Load refined masks if they exist (from refine_mask/add_mask), otherwise run SAM-3 from scratch
-    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    masks_file = get_correction_masks_file(run_dir, frame_idx)
     if masks_file.exists():
         log.info(f"[PREVIEW_CORRECTION_UPDATE] Loading refined masks from {masks_file}")
-        loaded_masks = np.load(masks_file, allow_pickle=True)
-        # Ensure all loaded masks are numpy arrays and boolean
-        new_masks = []
-        for i, m in enumerate(loaded_masks):
-            if not isinstance(m, np.ndarray):
-                log.warning(f"[PREVIEW_CORRECTION_UPDATE] Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
-                m = np.asarray(m)
-            if m.dtype != bool:
-                log.warning(f"[PREVIEW_CORRECTION_UPDATE] Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
-                m = (m > 0.5).astype(bool)
-            new_masks.append(m)
+        new_masks = load_masks_safely(masks_file)
         log.info(f"[PREVIEW_CORRECTION_UPDATE] Loaded {len(new_masks)} refined masks")
     else:
         # Fall back to running SAM-3 from scratch if no refined masks exist
@@ -4411,14 +4821,8 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
         log.info(f"[PREVIEW_CORRECTION_UPDATE] Got {len(new_masks)} masks from SAM-3")
     
     # Load frame (make a copy so we don't modify the original)
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {frame_idx}")
+    frame = load_frame_safely(frame_path, frame_idx=frame_idx)
     frame = frame.copy()  # Make a copy to avoid modifying original
-    
-    def color_for(i: int):
-        rng = np.random.RandomState(i)
-        return tuple(int(x) for x in rng.randint(50, 255, size=3))
     
     # Render masks with user's current ID mappings (skip deleted ones)
     rendered_count = 0
@@ -4432,7 +4836,7 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
             continue
         
         mask = new_masks[mask_idx]
-        col = color_for(final_id)
+        col = get_color_for_id(final_id, min_val=0)
         overlay = frame.copy()
         overlay[mask] = col
         frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -4467,17 +4871,13 @@ def preview_correction_update(run_id: str, frame_idx: int, preview_update: Previ
     # Save assignments file to preserve deletions (ID <= 0) for add_mask to use
     # Convert string keys to int keys for consistency
     assignments = {int(k): int(v) for k, v in preview_update.mapping.items()}
-    assignments_file = run_dir / f"correction_assignments_{frame_idx}.npy"
+    assignments_file = get_correction_assignments_file(run_dir, frame_idx)
+    assignments_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(assignments_file, assignments)
     deleted_count = sum(1 for v in assignments.values() if v <= 0)
     log.info(f"[PREVIEW_CORRECTION_UPDATE] Saved assignments to {assignments_file} (including {deleted_count} deleted masks)")
     
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode frame")
-    
-    import base64
-    image_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    image_b64 = encode_frame_to_base64(frame, quality=90)
     
     return JSONResponse(content={
         "image": f"data:image/jpeg;base64,{image_b64}",
@@ -4489,8 +4889,6 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
     Apply user's ID mapping to save corrected frame.
     id_mapping: dict mapping mask_index -> final_id
     """
-    import numpy as np
-    from PIL import Image
     
     log.info(f"/apply_correction run_id={run_id} frame_idx={frame_idx} mapping={id_mapping}")
     
@@ -4513,23 +4911,31 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
     # Check if refined masks exist (from point-based refinement)
-    masks_file = run_dir / f"correction_masks_{frame_idx}.npy"
+    masks_file = get_correction_masks_file(run_dir, frame_idx)
     log.info(f"[APPLY_CORRECTION] Checking for refined masks: {masks_file} (exists: {masks_file.exists()})")
+    log.info(f"[APPLY_CORRECTION] Frame index: {frame_idx}, expected file: {masks_file.name}")
+    
+    # Validate frame index in file path
+    if f"correction_masks_{frame_idx}" not in str(masks_file):
+        log.error(f"[APPLY_CORRECTION] ⚠️  FRAME INDEX MISMATCH! frame_idx={frame_idx} but file path is {masks_file}")
     
     if masks_file.exists():
-        log.info(f"[APPLY_CORRECTION] Using refined masks from {masks_file}")
-        loaded_masks = np.load(masks_file, allow_pickle=True)
-        # Ensure all loaded masks are numpy arrays and boolean
-        new_masks = []
-        for i, m in enumerate(loaded_masks):
-            if not isinstance(m, np.ndarray):
-                log.warning(f"[APPLY_CORRECTION] Loaded mask {i} is not a numpy array (type: {type(m)}), converting.")
-                m = np.asarray(m)
-            if m.dtype != bool:
-                log.warning(f"[APPLY_CORRECTION] Loaded mask {i} is not boolean (dtype: {m.dtype}), converting.")
-                m = (m > 0.5).astype(bool)
-            new_masks.append(m)
-        log.info(f"[APPLY_CORRECTION] Loaded {len(new_masks)} refined masks")
+        log.info(f"[APPLY_CORRECTION] Using refined masks from {masks_file} for frame {frame_idx}")
+        new_masks = load_masks_safely(masks_file)
+        log.info(f"[APPLY_CORRECTION] Loaded {len(new_masks)} refined masks from {masks_file.name} for frame {frame_idx}")
+        
+        # Validate that masks match the expected frame dimensions
+        if new_masks:
+            expected_img = Image.open(frame_path)
+            expected_H, expected_W = expected_img.size[1], expected_img.size[0]
+            actual_H, actual_W = new_masks[0].shape
+            if (actual_H, actual_W) != (expected_H, expected_W):
+                log.error(f"[APPLY_CORRECTION] ⚠️  DIMENSION MISMATCH! Frame {frame_idx} expects {expected_H}x{expected_W}, but masks are {actual_H}x{actual_W}")
+                log.error(f"[APPLY_CORRECTION] This suggests masks might be from a different frame! Regenerating masks...")
+                new_masks = run_sam3_on_frame(prompt, frame_path)
+                log.info(f"[APPLY_CORRECTION] Regenerated {len(new_masks)} masks with correct dimensions")
+            else:
+                log.info(f"[APPLY_CORRECTION] ✓ Mask dimensions match frame: {actual_H}x{actual_W}")
     else:
         # Fall back to running SAM-3 from scratch if no refined masks exist
         log.info(f"[APPLY_CORRECTION] No refined masks found, running SAM-3 from scratch")
@@ -4550,8 +4956,10 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
         if final_id <= 0:  # Skip deleted masks (0 or negative)
             log.info(f"[APPLY_CORRECTION] Skipping mask {mask_idx} (deleted, final_id={final_id})")
             continue
-        label_map[new_masks[mask_idx]] = final_id
-        log.info(f"[APPLY_CORRECTION] Assigned mask {mask_idx} -> ID {final_id}")
+        # Ensure mask is boolean for indexing
+        mask_bool = new_masks[mask_idx].astype(bool) if new_masks[mask_idx].dtype != bool else new_masks[mask_idx]
+        label_map[mask_bool] = final_id
+        log.info(f"[APPLY_CORRECTION] Assigned mask {mask_idx} -> ID {final_id} (mask shape: {mask_bool.shape}, pixels: {mask_bool.sum()})")
     
     # NOTE: We do NOT renumber IDs during corrections. The user (or auto-assignment) has
     # explicitly chosen which IDs to use, and these IDs are meant to match existing IDs
@@ -4560,7 +4968,7 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
     # should be preserved.
     
     # Save to golden
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     ensure_dir(golden_ann_dir)
     
     # Save original tracked mask (if it exists) before overwriting with corrected version
@@ -4575,12 +4983,28 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
     
     # Save corrected annotation
     corrected_ann_path = golden_ann_dir / f"{frame_idx:05d}.png"
+    log.info(f"[APPLY_CORRECTION] ========== SAVING CORRECTED FRAME ==========")
+    log.info(f"[APPLY_CORRECTION] Frame index: {frame_idx}")
+    log.info(f"[APPLY_CORRECTION] Source masks file: {masks_file.name if masks_file.exists() else 'N/A (regenerated)'}")
+    log.info(f"[APPLY_CORRECTION] Target golden annotation: {corrected_ann_path.name}")
+    log.info(f"[APPLY_CORRECTION] Label map shape: {label_map.shape}, dtype: {label_map.dtype}, max_id: {label_map.max()}")
+    
+    # Validate frame index in file name
+    expected_filename = f"{frame_idx:05d}.png"
+    if corrected_ann_path.name != expected_filename:
+        log.error(f"[APPLY_CORRECTION] ⚠️  FILENAME MISMATCH! Expected {expected_filename}, got {corrected_ann_path.name}")
+    
     Image.fromarray(label_map).save(corrected_ann_path)
-    log.info(f"Saved corrected annotation to {corrected_ann_path}")
+    
+    # Verify what was actually saved
+    verify_saved = np.array(Image.open(corrected_ann_path))
+    log.info(f"[APPLY_CORRECTION] ✓ Saved corrected annotation for frame {frame_idx}")
+    log.info(f"[APPLY_CORRECTION] Verified saved: shape={verify_saved.shape}, max_id={verify_saved.max()}, file={corrected_ann_path.name}")
+    log.info(f"[APPLY_CORRECTION] ===========================================")
     
     # Also copy JPEG frame
     log.info(f"[APPLY_CORRECTION] Copying JPEG frame, jpeg_dir={jpeg_dir}")
-    golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+    golden_jpeg_dir = get_golden_jpeg_dir(run_dir)
     ensure_dir(golden_jpeg_dir)
     src_jpeg_frame = jpeg_dir / f"{frame_idx:05d}.jpg"
     log.info(f"[APPLY_CORRECTION] Source JPEG: {src_jpeg_frame} (exists: {src_jpeg_frame.exists()})")
@@ -4659,8 +5083,6 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
     4. Save corrected annotation to golden
     5. Return frame image with masks and assigned IDs
     """
-    import numpy as np
-    from PIL import Image
     
     log.info(f"/correct_frame run_id={run_id} wrong_frame_idx={wrong_frame_idx}")
     
@@ -4700,11 +5122,11 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
         seed_idx = int(chunk_kv["seed_idx"])
         end_idx = int(chunk_kv["end_idx"])
         
-        golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+        golden_ann_dir = get_golden_ann_dir(run_dir)
         ensure_dir(golden_ann_dir)
         
         # Also copy JPEG frames
-        golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+        golden_jpeg_dir = get_golden_jpeg_dir(run_dir)
         ensure_dir(golden_jpeg_dir)
         src_jpeg = src_root / "JPEGImages" / VIDEO_NAME
         
@@ -4714,6 +5136,7 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
         log.info(f"[DEBUG] Committing frames {seed_idx+1}..{commit_end} (chunk has {seed_idx}..{end_idx}, requested up to {commit_up_to})")
         
         committed = 0
+        skipped_corrected = 0
         for orig_idx in range(seed_idx + 1, commit_end + 1):
             rel = orig_idx - seed_idx
             src = chunk_ann_dir / f"{rel:05d}.png"
@@ -4721,17 +5144,50 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
                 log.warning(f"Missing chunk mask for frame {orig_idx} (relative {rel} in chunk), skipping")
                 continue
             dst = golden_ann_dir / f"{orig_idx:05d}.png"
-            shutil.copy2(src, dst)
             
-            # Also copy JPEG frame
+            # Validate frame index alignment
+            log.debug(f"[COMMIT] Copying frame: seed_idx={seed_idx}, orig_idx={orig_idx}, rel={rel}, src={src.name}, dst={dst.name}")
+            
+            # Check if this frame already has a corrected mask in golden
+            if dst.exists():
+                # Load both masks to compare
+                existing_mask = np.array(Image.open(dst))
+                chunk_mask = np.array(Image.open(src))
+                
+                # Validate dimensions match (safety check for frame alignment)
+                if existing_mask.shape != chunk_mask.shape:
+                    log.error(f"[COMMIT] ⚠️  DIMENSION MISMATCH for frame {orig_idx}! Existing: {existing_mask.shape}, Chunk: {chunk_mask.shape}")
+                    log.error(f"[COMMIT] This suggests a frame index mismatch! Skipping this frame.")
+                    continue
+                
+                # Check if masks are different (not just same IDs)
+                masks_different = not np.array_equal(existing_mask, chunk_mask)
+                
+                if masks_different:
+                    log.info(f"[COMMIT] Frame {orig_idx} has corrected mask in golden (differs from chunk), skipping overwrite")
+                    skipped_corrected += 1
+                    # Don't overwrite - keep the corrected mask
+                else:
+                    # Masks are identical, safe to overwrite
+                    shutil.copy2(src, dst)
+                    log.debug(f"[COMMIT] Copied frame {orig_idx}: {src.name} -> {dst.name}")
+                    committed += 1
+            else:
+                # Frame doesn't exist in golden, safe to copy
+                shutil.copy2(src, dst)
+                log.debug(f"[COMMIT] Copied NEW frame {orig_idx}: {src.name} -> {dst.name}")
+                committed += 1
+            
+            # Always copy JPEG frame (even if mask was skipped)
             src_jpeg_frame = src_jpeg / f"{orig_idx:05d}.jpg"
             if src_jpeg_frame.exists():
                 dst_jpeg_frame = golden_jpeg_dir / f"{orig_idx:05d}.jpg"
                 shutil.copy2(src_jpeg_frame, dst_jpeg_frame)
-            
-            committed += 1
         
-        log.info(f"✅ Committed {committed} frames to golden: {seed_idx+1}..{commit_end}")
+        if skipped_corrected > 0:
+            log.info(f"✅ Committed {committed} frames to golden: {seed_idx+1}..{commit_end} (skipped {skipped_corrected} corrected frames)")
+        else:
+            log.info(f"✅ Committed {committed} frames to golden: {seed_idx+1}..{commit_end}")
         
         if commit_up_to > end_idx:
             log.warning(f"⚠️  Requested commit up to frame {commit_up_to}, but chunk only goes to {end_idx}. Only committed {seed_idx+1}..{end_idx}")
@@ -4773,7 +5229,7 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
     
     # Step 3: Auto-assign IDs based on previous frame
     prev_frame_idx = wrong_frame_idx - 1
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     prev_ann_path = golden_ann_dir / f"{prev_frame_idx:05d}.png"
     
     if not prev_ann_path.exists():
@@ -4789,13 +5245,13 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
         label_map[new_masks[new_idx]] = assigned_id
     
     # Save to golden
-    golden_ann_dir = run_dir / "golden" / "Annotations" / VIDEO_NAME
+    golden_ann_dir = get_golden_ann_dir(run_dir)
     ensure_dir(golden_ann_dir)
     corrected_ann_path = golden_ann_dir / f"{wrong_frame_idx:05d}.png"
     Image.fromarray(label_map).save(corrected_ann_path)
     
     # Also copy JPEG frame to golden/JPEGImages/video1/
-    golden_jpeg_dir = run_dir / "golden" / "JPEGImages" / VIDEO_NAME
+    golden_jpeg_dir = get_golden_jpeg_dir(run_dir)
     ensure_dir(golden_jpeg_dir)
     src_jpeg_frame = jpeg_dir / f"{wrong_frame_idx:05d}.jpg"
     if src_jpeg_frame.exists():
@@ -4830,23 +5286,15 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
         log.warning(f"Failed to update golden preview video with corrected frame (non-fatal): {e}")
     
     # Step 5: Return frame image with overlays (reuse get_frame logic)
-    import cv2
-    from fastapi.responses import Response
     
-    frame = cv2.imread(str(frame_path))
-    if frame is None:
-        raise HTTPException(500, f"Could not read frame {wrong_frame_idx}")
-    
-    def color_for(i: int):
-        rng = np.random.RandomState(i)
-        return tuple(int(x) for x in rng.randint(50, 255, size=3))
+    frame = load_frame_safely(frame_path, frame_idx=wrong_frame_idx)
     
     for cid in range(1, int(label_map.max()) + 1):
         m = (label_map == cid)
         if not m.any():
             continue
         
-        col = color_for(cid)
+        col = get_color_for_id(cid)
         overlay = frame.copy()
         overlay[m] = col
         frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
@@ -4874,6 +5322,7 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
             thickness,
         )
     
+    # Encode frame to JPEG bytes for Response
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
         raise HTTPException(status_code=500, detail="failed to encode frame")
@@ -4952,66 +5401,41 @@ def download_golden(run_id: str, background_tasks: BackgroundTasks):
     """
     Download the golden folder as a zip file.
     """
-    import tempfile
-    import zipfile
-    from fastapi.responses import FileResponse
-    
     log.info(f"/download_golden run_id={run_id}")
     
     run_dir = RUNS_ROOT / run_id
-    meta_path = run_dir / "meta.txt"
-    if not meta_path.exists():
-        raise HTTPException(404, "run_id not found")
-    
     golden_root = run_dir / "golden"
-    if not golden_root.exists():
-        raise HTTPException(404, f"Golden folder not found for run_id: {run_id}")
     
-    # Create a temporary zip file in scratch space (not /tmp which may be full)
+    # Create a temporary zip file in scratch space
     scratch_tmp = Path("/scratch/project_2016918/tmp")
     scratch_tmp.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=str(scratch_tmp)) as tmp_zip:
         zip_path = Path(tmp_zip.name)
     
-    try:
-        # Create zip file with golden folder contents
-        log.info(f"[DOWNLOAD_GOLDEN] Creating zip file: {zip_path}")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Walk through the golden folder and add all files
-            for file_path in golden_root.rglob('*'):
-                if file_path.is_file():
-                    # Get relative path from golden_root
-                    arcname = file_path.relative_to(golden_root)
-                    zipf.write(file_path, arcname)
-                    log.debug(f"[DOWNLOAD_GOLDEN] Added to zip: {arcname}")
-        
-        log.info(f"[DOWNLOAD_GOLDEN] Zip file created: {zip_path} ({zip_path.stat().st_size} bytes)")
-        
-        # Return the zip file as a download
-        # Clean up the temp file after download
-        def cleanup_zip():
-            if zip_path.exists():
-                try:
-                    zip_path.unlink()
-                    log.info(f"[DOWNLOAD_GOLDEN] Cleaned up temp zip file: {zip_path}")
-                except Exception as e:
-                    log.warning(f"[DOWNLOAD_GOLDEN] Failed to clean up zip file: {e}")
-        
-        background_tasks.add_task(cleanup_zip)
-        
-        return FileResponse(
-            path=str(zip_path),
-            filename=f"{run_id}_golden.zip",
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={run_id}_golden.zip"},
-            background=background_tasks
-        )
-    except Exception as e:
-        # Clean up temp file on error
-        if zip_path.exists():
-            zip_path.unlink()
-        log.error(f"[DOWNLOAD_GOLDEN] Error creating zip: {e}")
-        raise HTTPException(500, f"Failed to create zip file: {str(e)}")
+    # Create zip file with golden folder contents
+    log.info(f"[DOWNLOAD_GOLDEN] Creating zip file: {zip_path}")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for file_path in golden_root.rglob('*'):
+            if file_path.is_file():
+                arcname = file_path.relative_to(golden_root)
+                zipf.write(file_path, arcname)
+    
+    log.info(f"[DOWNLOAD_GOLDEN] Zip file created: {zip_path} ({zip_path.stat().st_size} bytes)")
+    
+    # Clean up temp file after download
+    def cleanup_zip():
+        zip_path.unlink()
+        log.info(f"[DOWNLOAD_GOLDEN] Cleaned up temp zip file: {zip_path}")
+    
+    background_tasks.add_task(cleanup_zip)
+    
+    return FileResponse(
+        path=str(zip_path),
+        filename=f"{run_id}_golden.zip",
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={run_id}_golden.zip"},
+        background=background_tasks
+    )
 
 
 @app.get("/health")

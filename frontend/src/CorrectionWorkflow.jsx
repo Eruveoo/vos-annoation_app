@@ -240,9 +240,10 @@ export default function CorrectionWorkflow({
         );
         
         // Switch back to refine mode after adding
+        // Remember the initial point used to create the mask for future refinements
         setMode("refine");
         setSelectedMaskIndex(result.new_mask_index);
-        setRefinementPoints([]);
+        setRefinementPoints([{ x, y, is_positive: true }]); // Keep the initial point
       } else {
         // Refine existing mask
         if (selectedMaskIndex === null) {
@@ -274,11 +275,8 @@ export default function CorrectionWorkflow({
         
         if (result.warning) {
           setError(`⚠️ ${result.warning}`);
-        } else {
-          setSuccess(
-            `✅ Mask ${selectedMaskIndex} refined! Point ${isPositive ? "added" : "removed"}. New size: ${result.refined_mask_size} pixels.`
-          );
         }
+        // Success message removed - refinement is visible in the preview
       }
     } catch (e) {
       setError(`Failed to ${mode === "add_mask" ? "add mask" : "refine mask"}: ${e.message}`);
@@ -345,9 +343,7 @@ export default function CorrectionWorkflow({
       if (result.warning) {
         setError(`⚠️ ${result.warning}`);
       } else {
-        setSuccess(
-          `✅ Point deleted! Mask refined with ${updatedPoints.length} remaining point${updatedPoints.length !== 1 ? "s" : ""}. New size: ${result.refined_mask_size} pixels.`
-        );
+        // Success message removed - refinement is visible in the preview
       }
     } catch (e) {
       setError(`Failed to refine mask after deletion: ${e.message}`);
