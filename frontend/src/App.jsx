@@ -19,6 +19,9 @@ export default function App() {
   const [frame0Image, setFrame0Image] = useState(null);
   const [maskAssignments, setMaskAssignments] = useState([]);
 
+  // Resume info for VideoSelectionPage (optional)
+  const [resumeRunId, setResumeRunId] = useState("");
+
   // ID assignment state
   const [idMapping, setIdMapping] = useState({});
 
@@ -37,6 +40,18 @@ export default function App() {
     testConnection().then((connected) => {
       setConnectionStatus(connected);
     });
+  }, []);
+
+  // Load last run id (best-effort)
+  useEffect(() => {
+    try {
+      const last = window.localStorage.getItem("vos_last_run_id");
+      if (last && typeof last === "string") {
+        setResumeRunId(last);
+      }
+    } catch {
+      // ignore
+    }
   }, []);
 
   // Handle video prepared - go to initialize page
@@ -103,6 +118,31 @@ export default function App() {
     }
   };
 
+  const handleResumeSession = async (inputRunId) => {
+    const rid = (inputRunId || "").trim();
+    if (!rid) return;
+    setRunId(rid);
+    try {
+      window.localStorage.setItem("vos_last_run_id", rid);
+    } catch {
+      // ignore
+    }
+
+    // Decide where to navigate based on whether golden exists (initialized sessions have golden_max_idx != null)
+    try {
+      const prog = await getProgress(rid);
+      if (prog.golden_max_idx !== null && prog.golden_max_idx !== undefined) {
+        setCurrentPage("main-workspace");
+      } else {
+        // Session exists but not initialized yet; stay on upload page so user can run init SAM.
+        setCurrentPage("video-selection");
+      }
+    } catch {
+      // If progress fails, still keep user on video selection (VideoSelectionPage will show error)
+      setCurrentPage("video-selection");
+    }
+  };
+
   // Render current page
   switch (currentPage) {
     case "video-selection":
@@ -110,7 +150,9 @@ export default function App() {
         <VideoSelectionPage
           onVideoLoaded={handleVideoLoaded}
           onInitialized={handleInitialized}
+          onResumeSession={handleResumeSession}
           connectionStatus={connectionStatus}
+          defaultResumeRunId={resumeRunId}
         />
       );
 

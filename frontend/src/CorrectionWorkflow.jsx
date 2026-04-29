@@ -116,8 +116,13 @@ export default function CorrectionWorkflow({
       setSelectedMaskIndex(null);
       setRefinementPoints([]);
       
+      // If no masks found, default to "add_mask" mode so user can add masks
+      if (result.mask_assignments.length === 0) {
+        setMode("add_mask");
+      }
+      
       setSuccess(
-        `✅ Frame ${frameIdx} prepared! Found ${result.mask_assignments.length} masks. Review and assign IDs below.`
+        `✅ Frame ${frameIdx} prepared! Found ${result.mask_assignments.length} masks. ${result.mask_assignments.length === 0 ? "You can add masks using point prompts below." : "Review and assign IDs below."}`
       );
     } catch (e) {
       setError(`Failed to prepare correction: ${e.message}`);
@@ -565,7 +570,7 @@ export default function CorrectionWorkflow({
       )}
 
       {/* Correction preview and ID assignment */}
-      {correctionImage && maskAssignments.length > 0 && (
+      {correctionImage && (
         <div style={{ marginBottom: 24 }}>
           <h4>Review and Assign IDs</h4>
           

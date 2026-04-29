@@ -2282,21 +2282,53 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
             log.info(f"Creating chunk dataset: seed={current_seed}, end={chunk_end}")
             chunk_ds = make_chunk_dataset(run_dir, current_seed, chunk_end, seed_ann_path=seed_ann_path)
             
-            # Run XMem on this chunk
+            # Check if seed annotation is empty (all zeros) - if so, skip XMem and create empty masks
+            seed_ann_file = chunk_ds / "Annotations" / VIDEO_NAME / "00000.png"
+            seed_ann = np.array(Image.open(seed_ann_file))
+            is_empty_seed = (seed_ann.max() == 0)
+            
             xmem_output = run_dir / "xmem_outputs" / f"{current_seed:05d}_{chunk_end:05d}"
             ensure_dir(xmem_output.parent)
             
-            # Update progress before XMem
-            track_progress[run_id] = {
-                "stage": "tracking",
-                "progress": progress_pct,
-                "message": f"Running XMem on chunk {current_seed}..{chunk_end}...",
-                "current_frame": current_seed,
-                "total_frames": end_idx,
-            }
-            
-            logs = run_xmem(chunk_ds, xmem_output)
-            masks = find_xmem_pngs(xmem_output)
+            if is_empty_seed:
+                log.info(f"[TRACK] Chunk {current_seed}..{chunk_end}: Seed annotation is empty (all zeros), skipping XMem and creating empty masks")
+                logs = []
+                
+                # Update progress (same as XMem would)
+                track_progress[run_id] = {
+                    "stage": "tracking",
+                    "progress": progress_pct,
+                    "message": f"Creating empty masks for chunk {current_seed}..{chunk_end} (no objects to track)...",
+                    "current_frame": current_seed,
+                    "total_frames": end_idx,
+                }
+                
+                # Create empty masks for all frames (same size as seed annotation)
+                ensure_clean_dir(xmem_output)
+                xmem_ann_dir = xmem_output / VIDEO_NAME
+                ensure_dir(xmem_ann_dir)
+                
+                # Create empty mask (all zeros) for each frame
+                empty_mask = np.zeros_like(seed_ann, dtype=np.uint8)
+                n_frames = chunk_end - current_seed + 1
+                for i in range(n_frames):
+                    mask_path = xmem_ann_dir / f"{i:05d}.png"
+                    Image.fromarray(empty_mask).save(mask_path)
+                
+                masks = find_xmem_pngs(xmem_output)
+                log.info(f"[TRACK] Created {len(masks)} empty masks for chunk {current_seed}..{chunk_end}")
+            else:
+                # Update progress before XMem
+                track_progress[run_id] = {
+                    "stage": "tracking",
+                    "progress": progress_pct,
+                    "message": f"Running XMem on chunk {current_seed}..{chunk_end}...",
+                    "current_frame": current_seed,
+                    "total_frames": end_idx,
+                }
+                
+                logs = run_xmem(chunk_ds, xmem_output)
+                masks = find_xmem_pngs(xmem_output)
             
             # Store masks into chunk folder
             chunk_root = run_dir / "chunks" / f"{current_seed:05d}_{chunk_end:05d}"
@@ -2402,20 +2434,54 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
         seed_ann_path = None
         chunk_ds = make_chunk_dataset(run_dir, seed_idx, end_idx, seed_ann_path=seed_ann_path)
 
-        # Update progress before XMem
-        track_progress[run_id] = {
-            "stage": "tracking",
-            "progress": 30,
-            "message": "Running XMem...",
-            "current_frame": seed_idx,
-            "total_frames": end_idx,
-        }
+        # Check if seed annotation is empty (all zeros) - if so, skip XMem and create empty masks
+        seed_ann_file = chunk_ds / "Annotations" / VIDEO_NAME / "00000.png"
+        seed_ann = np.array(Image.open(seed_ann_file))
+        is_empty_seed = (seed_ann.max() == 0)
+        
+        if is_empty_seed:
+            log.info(f"[TRACK] Seed annotation is empty (all zeros), skipping XMem and creating empty masks for all frames")
+            logs = []
+            
+            # Update progress (same as XMem would)
+            track_progress[run_id] = {
+                "stage": "tracking",
+                "progress": 30,
+                "message": "Creating empty masks (no objects to track)...",
+                "current_frame": seed_idx,
+                "total_frames": end_idx,
+            }
+            
+            # Create empty masks for all frames (same size as seed annotation)
+            xmem_output = run_dir / "xmem_outputs" / f"{seed_idx:05d}_{end_idx:05d}"
+            ensure_clean_dir(xmem_output)
+            xmem_ann_dir = xmem_output / VIDEO_NAME
+            ensure_dir(xmem_ann_dir)
+            
+            # Create empty mask (all zeros) for each frame
+            empty_mask = np.zeros_like(seed_ann, dtype=np.uint8)
+            n_frames = end_idx - seed_idx + 1
+            for i in range(n_frames):
+                mask_path = xmem_ann_dir / f"{i:05d}.png"
+                Image.fromarray(empty_mask).save(mask_path)
+            
+            masks = find_xmem_pngs(xmem_output)
+            log.info(f"[TRACK] Created {len(masks)} empty masks (no tracking performed)")
+        else:
+            # Update progress before XMem
+            track_progress[run_id] = {
+                "stage": "tracking",
+                "progress": 30,
+                "message": "Running XMem...",
+                "current_frame": seed_idx,
+                "total_frames": end_idx,
+            }
 
-        # Run XMem on this chunk dataset
-        xmem_output = run_dir / "xmem_outputs" / f"{seed_idx:05d}_{end_idx:05d}"
-        ensure_dir(xmem_output.parent)
-        logs = run_xmem(chunk_ds, xmem_output)
-        masks = find_xmem_pngs(xmem_output)
+            # Run XMem on this chunk dataset
+            xmem_output = run_dir / "xmem_outputs" / f"{seed_idx:05d}_{end_idx:05d}"
+            ensure_dir(xmem_output.parent)
+            logs = run_xmem(chunk_ds, xmem_output)
+            masks = find_xmem_pngs(xmem_output)
         
         # Update progress after XMem
         track_progress[run_id] = {
@@ -3686,10 +3752,17 @@ def prepare_correction(run_id: str, frame_idx: int):
         raise HTTPException(404, f"Frame {frame_idx} not found")
     
     log.info(f"[PREPARE_CORRECTION] Running SAM-3 on frame {frame_idx}")
-    new_masks = run_sam3_on_frame(prompt, frame_path)
-    log.info(f"[PREPARE_CORRECTION] SAM-3 found {len(new_masks)} masks for frame {frame_idx}")
+    try:
+        new_masks = run_sam3_on_frame(prompt, frame_path)
+        log.info(f"[PREPARE_CORRECTION] SAM-3 found {len(new_masks)} masks for frame {frame_idx}")
+    except RuntimeError as e:
+        if "No valid masks from SAM-3" in str(e):
+            log.warning(f"[PREPARE_CORRECTION] SAM-3 found no masks for frame {frame_idx} (this is OK - user can add masks with point prompts)")
+            new_masks = []  # Empty list - user can add masks manually
+        else:
+            raise  # Re-raise other RuntimeErrors
     
-    # Save masks temporarily for refinement
+    # Save masks temporarily for refinement (even if empty, so refinement can add masks)
     masks_file = get_correction_masks_file(run_dir, frame_idx)
     masks_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(masks_file, new_masks)
@@ -3712,26 +3785,31 @@ def prepare_correction(run_id: str, frame_idx: int):
     
     # Step 4: Auto-assign IDs - prefer using the frame's tracked annotation if it exists
     # This allows re-correction while preserving previous ID assignments
-    reference_label_map = tracked_label_map
-    reference_source = f"frame {frame_idx} ({tracked_source})" if tracked_label_map is not None else None
-    
-    # Fall back to previous frame if no tracked annotation found
-    if reference_label_map is None:
-        prev_frame_idx = frame_idx - 1
-        prev_mask_path, _ = find_tracked_mask_for_frame(run_dir, prev_frame_idx)
+    # If no masks found, skip ID matching (user will add masks manually)
+    assignments = {}
+    if new_masks:
+        reference_label_map = tracked_label_map
+        reference_source = f"frame {frame_idx} ({tracked_source})" if tracked_label_map is not None else None
         
-        if prev_mask_path and prev_mask_path.exists():
-            reference_label_map = np.array(Image.open(prev_mask_path))
-            reference_source = f"frame {prev_frame_idx} (previous frame)"
-            log.info(f"Using previous frame {prev_frame_idx} as reference for ID matching")
-        else:
-            raise HTTPException(500, f"Previous frame annotation not found for frame {prev_frame_idx}")
+        # Fall back to previous frame if no tracked annotation found
+        if reference_label_map is None:
+            prev_frame_idx = frame_idx - 1
+            prev_mask_path, _ = find_tracked_mask_for_frame(run_dir, prev_frame_idx)
+            
+            if prev_mask_path and prev_mask_path.exists():
+                reference_label_map = np.array(Image.open(prev_mask_path))
+                reference_source = f"frame {prev_frame_idx} (previous frame)"
+                log.info(f"Using previous frame {prev_frame_idx} as reference for ID matching")
+            else:
+                raise HTTPException(500, f"Previous frame annotation not found for frame {prev_frame_idx}")
+        
+        assignments = auto_assign_ids(new_masks, reference_label_map, iou_threshold=0.2)
+        log.info(f"[PREPARE_CORRECTION] ID matching completed using {reference_source}")
+        log.info(f"[PREPARE_CORRECTION] Assignments: {assignments}")
+    else:
+        log.info(f"[PREPARE_CORRECTION] No masks found by SAM-3, skipping ID matching (user can add masks with point prompts)")
     
-    assignments = auto_assign_ids(new_masks, reference_label_map, iou_threshold=0.2)
-    log.info(f"[PREPARE_CORRECTION] ID matching completed using {reference_source}")
-    log.info(f"[PREPARE_CORRECTION] Assignments: {assignments}")
-    
-    # Save assignments for use during refinement (to preserve IDs)
+    # Save assignments for use during refinement (to preserve IDs, even if empty)
     assignments_file = get_correction_assignments_file(run_dir, frame_idx)
     assignments_file.parent.mkdir(parents=True, exist_ok=True)
     np.save(assignments_file, assignments)
@@ -3793,39 +3871,42 @@ def prepare_correction(run_id: str, frame_idx: int):
         log.info(f"[PREPARE_CORRECTION] No tracked masks to render (tracked_label_map is None)")
     
     # Then render new SAM masks with auto-assigned IDs (more prominent)
-    log.info(f"[PREPARE_CORRECTION] Rendering {len(assignments)} new SAM masks")
-    for mask_idx, assigned_id in assignments.items():
-        mask = new_masks[mask_idx]
-        mask_pixels = int(mask.sum())
-        log.info(f"[PREPARE_CORRECTION] Rendering SAM mask {mask_idx} -> ID {assigned_id} ({mask_pixels} pixels)")
-        col = get_color_for_id(assigned_id, min_val=0)
-        overlay = frame.copy()
-        overlay[mask] = col
-        frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)  # More prominent overlay for new masks
-        
-        ys, xs = np.where(mask)
-        if len(ys) == 0:
-            continue  # Skip empty masks
-        cx, cy = int(xs.mean()), int(ys.mean())
-        
-        text = str(assigned_id)
-        font_scale = 0.8
-        thickness = 2
-        (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        
-        text_x = cx - text_width // 2
-        text_y = cy + text_height // 2
-        
-        cv2.putText(
-            frame,
-            text,
-            (text_x, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (255, 255, 255),
-            thickness,
-            cv2.LINE_AA,
-        )
+    if new_masks and assignments:
+        log.info(f"[PREPARE_CORRECTION] Rendering {len(assignments)} new SAM masks")
+        for mask_idx, assigned_id in assignments.items():
+            mask = new_masks[mask_idx]
+            mask_pixels = int(mask.sum())
+            log.info(f"[PREPARE_CORRECTION] Rendering SAM mask {mask_idx} -> ID {assigned_id} ({mask_pixels} pixels)")
+            col = get_color_for_id(assigned_id, min_val=0)
+            overlay = frame.copy()
+            overlay[mask] = col
+            frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)  # More prominent overlay for new masks
+            
+            ys, xs = np.where(mask)
+            if len(ys) == 0:
+                continue  # Skip empty masks
+            cx, cy = int(xs.mean()), int(ys.mean())
+            
+            text = str(assigned_id)
+            font_scale = 0.8
+            thickness = 2
+            (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+            
+            text_x = cx - text_width // 2
+            text_y = cy + text_height // 2
+            
+            cv2.putText(
+                frame,
+                text,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+    else:
+        log.info(f"[PREPARE_CORRECTION] No new SAM masks to render (user can add masks with point prompts)")
     log.info(f"[PREPARE_CORRECTION] Preview rendering complete for frame {frame_idx}")
     
     # Frame encoding handled by encode_frame_to_base64 if needed

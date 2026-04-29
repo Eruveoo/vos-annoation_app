@@ -539,22 +539,17 @@ export async function downloadGolden(runId) {
   const url = `${BACKEND}/download_golden/${runId}`;
   
   try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      const error = await res.text();
-      throw new Error(`HTTP ${res.status}: ${error}`);
-    }
-    
-    // Get the blob and create a download link
-    const blob = await res.blob();
-    const downloadUrl = window.URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = downloadUrl;
+    // Important: the golden zip can be very large (hundreds of MB).
+    // Fetching it into memory via `res.blob()` is prone to failing with
+    // a generic "Failed to fetch" / OOM. Let the browser handle the download.
+    const link = document.createElement("a");
+    link.href = url;
+    link.rel = "noopener";
+    // `download` may be ignored for cross-origin URLs, but backend sets Content-Disposition anyway.
     link.download = `${runId}_golden.zip`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    window.URL.revokeObjectURL(downloadUrl);
   } catch (e) {
     console.error("[API] Failed to download golden folder:", e);
     throw e;
