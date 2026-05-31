@@ -2,9 +2,18 @@ import React, { useState, useEffect } from "react";
 import Frame0Preview from "../Frame0Preview.jsx";
 import IDAssignmentTable from "../IDAssignmentTable.jsx";
 import { matchInitIds, previewInitUpdate } from "../api.js";
+import { ANNOTATION_MODES, DEFAULT_BEHAVIOR_LABEL_ID } from "../behaviorLabels.js";
 
-export default function IDAssignmentPage({ runId, frame0Image, maskAssignments, onIdsApplied }) {
+export default function IDAssignmentPage({
+  runId,
+  frame0Image,
+  maskAssignments,
+  annotationMode = ANNOTATION_MODES.STANDARD,
+  onIdsApplied,
+}) {
   const [idMapping, setIdMapping] = useState({});
+  const [behaviorMapping, setBehaviorMapping] = useState({});
+  const isBehaviorMode = annotationMode === ANNOTATION_MODES.BEHAVIOR;
   const [currentFrame0Image, setCurrentFrame0Image] = useState(frame0Image);
   const [previousMaskFile, setPreviousMaskFile] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -20,6 +29,11 @@ export default function IDAssignmentPage({ runId, frame0Image, maskAssignments, 
         initialMapping[assignment.mask_index] = assignment.auto_assigned_id;
       });
       setIdMapping(initialMapping);
+      const initialBehavior = {};
+      maskAssignments.forEach((assignment) => {
+        initialBehavior[assignment.mask_index] = DEFAULT_BEHAVIOR_LABEL_ID;
+      });
+      setBehaviorMapping(initialBehavior);
     }
   }, [maskAssignments]);
 
@@ -102,8 +116,15 @@ export default function IDAssignmentPage({ runId, frame0Image, maskAssignments, 
           }}
         >
           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-            <h2 style={{ margin: 0 }}>Assign IDs</h2>
+            <h2 style={{ margin: 0 }}>
+              {isBehaviorMode ? "Assign IDs & behaviour (frame 0)" : "Assign IDs"}
+            </h2>
           </div>
+          {isBehaviorMode && (
+            <p style={{ margin: 0, fontSize: 14, color: "#6c757d", lineHeight: 1.5 }}>
+              Choose the initial behaviour label for each cow. You can update labels later in the Golden tab.
+            </p>
+          )}
 
         {/* Error/Success messages */}
         {error && (
@@ -257,13 +278,28 @@ export default function IDAssignmentPage({ runId, frame0Image, maskAssignments, 
               maskAssignments={maskAssignments}
               idMapping={idMapping}
               onMappingChange={setIdMapping}
+              showBehavior={isBehaviorMode}
+              behaviorMapping={behaviorMapping}
+              onBehaviorMappingChange={setBehaviorMapping}
             />
           </div>
         </div>
 
         {/* Apply button */}
         <button
-          onClick={() => onIdsApplied(idMapping)}
+          onClick={() => {
+            let behaviorByCowId = null;
+            if (isBehaviorMode) {
+              behaviorByCowId = {};
+              Object.entries(idMapping).forEach(([maskIdx, cowId]) => {
+                if (cowId !== undefined && cowId >= 1) {
+                  const labelId = behaviorMapping[maskIdx] || DEFAULT_BEHAVIOR_LABEL_ID;
+                  behaviorByCowId[String(cowId)] = labelId;
+                }
+              });
+            }
+            onIdsApplied(idMapping, behaviorByCowId);
+          }}
           disabled={busy}
           style={{
             position: "sticky",

@@ -339,15 +339,66 @@ export function getSourceVideoUrl(runId) {
  * @param {Object} mapping - Object mapping mask_index (string) to final_id (number)
  * @returns {Promise<{run_id: string, n_ids: number}>}
  */
-export async function applyInitIds(runId, mapping) {
+export async function applyInitIds(runId, mapping, behaviorByCowId = null) {
+  const body = { mapping };
+  if (behaviorByCowId && Object.keys(behaviorByCowId).length > 0) {
+    body.behavior_by_cow_id = behaviorByCowId;
+  }
   const res = await fetch(`${BACKEND}/apply_init_ids/${runId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mapping }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const error = await res.text();
     throw new Error(error);
+  }
+  return res.json();
+}
+
+export async function setAnnotationMode(runId, mode) {
+  const res = await fetch(`${BACKEND}/run/${runId}/annotation_mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`HTTP ${res.status}: ${error}`);
+  }
+  return res.json();
+}
+
+export async function getBehavior(runId, frame = null) {
+  const params = frame !== null ? `?frame=${frame}` : "";
+  const res = await fetch(`${BACKEND}/behavior/${runId}${params}`);
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`HTTP ${res.status}: ${error}`);
+  }
+  return res.json();
+}
+
+export async function setBehaviorLabel(runId, cowId, frame, labelId) {
+  const res = await fetch(`${BACKEND}/behavior/${runId}/set_label`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cow_id: cowId, frame, label_id: labelId }),
+  });
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`HTTP ${res.status}: ${error}`);
+  }
+  return res.json();
+}
+
+export async function rebuildGoldenPreview(runId) {
+  const res = await fetch(`${BACKEND}/golden/${runId}/rebuild_preview`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`HTTP ${res.status}: ${error}`);
   }
   return res.json();
 }

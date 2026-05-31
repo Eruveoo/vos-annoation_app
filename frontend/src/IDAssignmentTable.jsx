@@ -1,4 +1,5 @@
 import React from "react";
+import { BEHAVIOR_LABELS } from "./behaviorLabels.js";
 
 /**
  * Component for editing ID assignments
@@ -10,6 +11,9 @@ export default function IDAssignmentTable({
   maskAssignments,
   idMapping,
   onMappingChange,
+  showBehavior = false,
+  behaviorMapping = {},
+  onBehaviorMappingChange,
 }) {
   // Store the last known Final ID for each mask before deletion
   // This allows us to restore the user's custom ID when un-deleting
@@ -79,9 +83,10 @@ export default function IDAssignmentTable({
           }}
         >
           <colgroup>
-            <col style={{ width: 110 }} />
-            <col style={{ width: 140 }} />
-            <col style={{ width: 80 }} />
+            <col style={{ width: 90 }} />
+            <col style={{ width: 90 }} />
+            {showBehavior && <col style={{ width: 180 }} />}
+            <col style={{ width: 60 }} />
           </colgroup>
           <thead>
             <tr style={{ backgroundColor: "#f5f5f5" }}>
@@ -91,6 +96,11 @@ export default function IDAssignmentTable({
               <th style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
                 ID
               </th>
+              {showBehavior && (
+                <th style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
+                  Behaviour
+                </th>
+              )}
               <th style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
                 Delete
               </th>
@@ -137,6 +147,35 @@ export default function IDAssignmentTable({
                       }}
                     />
                   </td>
+                  {showBehavior && (
+                    <td style={{ padding: "8px 6px", border: "1px solid #ddd", textAlign: "center" }}>
+                      <select
+                        value={behaviorMapping[maskIndex] || "stand"}
+                        disabled={isDeleted}
+                        onChange={(e) => {
+                          if (!onBehaviorMappingChange) return;
+                          onBehaviorMappingChange({
+                            ...behaviorMapping,
+                            [maskIndex]: e.target.value,
+                          });
+                        }}
+                        style={{
+                          width: "100%",
+                          maxWidth: 170,
+                          fontSize: 12,
+                          padding: "4px 2px",
+                          borderRadius: 4,
+                          border: "1px solid #ccc",
+                        }}
+                      >
+                        {BEHAVIOR_LABELS.filter((l) => l.id !== "not_visible").map((l) => (
+                          <option key={l.id} value={l.id} title={l.descriptionFi}>
+                            {l.nameFi}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                  )}
                   <td style={{ padding: "8px 6px", textAlign: "center", border: "1px solid #ddd" }}>
                     <input
                       type="checkbox"

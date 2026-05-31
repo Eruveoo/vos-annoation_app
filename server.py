@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import shutil
@@ -16,7 +17,7 @@ import logging
 
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -177,6 +178,379 @@ def parse_meta_file(meta_path: Path) -> dict:
         if line.strip() and "=" in line
     ]
     return dict(meta_lines)
+
+
+def get_annotation_mode(run_dir: Path) -> str:
+    meta = parse_meta_file(run_dir / "meta.txt")
+    mode = (meta.get("annotation_mode") or "standard").strip().lower()
+    return mode if mode in ("standard", "behavior") else "standard"
+
+
+def update_meta_key(meta_path: Path, key: str, value: str) -> None:
+    lines = meta_path.read_text(encoding="utf-8").splitlines()
+    found = False
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith(f"{key}="):
+            new_lines.append(f"{key}={value}")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"{key}={value}")
+    meta_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+
+
+# -------------------------
+# Behaviour annotation: labels + segment storage
+# -------------------------
+NOT_VISIBLE_LABEL_ID = "not_visible"
+
+BEHAVIOR_LABELS: List[Dict[str, Any]] = [
+    {
+        "id": "walk",
+        "name_fi": "Kävelee",
+        "description_fi": (
+            "Eläin ottaa useita askeleita siirtyäkseen paikasta toiseen. Eläin liikkuu kohtalaisen "
+            "hitaasti siirtäen yhtä jalkaa kerrallaan eteenpäin. Myös peruuttaminen ja kääntyminen."
+        ),
+    },
+    {
+        "id": "trot_gallop",
+        "name_fi": "Ravaa tai laukkaa",
+        "description_fi": (
+            "Eläin ottaa useita askeleita siirtyäkseen paikasta toiseen. Eläin liikkuu kohtalaisen "
+            "nopeasti tai nopeasti joko symmetrisesti (ravi) tai laukaten."
+        ),
+    },
+    {
+        "id": "stand",
+        "name_fi": "Seisoo",
+        "description_fi": "Eläin seisoo paikoillaan vähintään kolmen jalan ollessa kosketuksissa maahan.",
+    },
+    {
+        "id": "lie_down",
+        "name_fi": "Makuulle laskeutuminen",
+        "description_fi": (
+            "Makuulle laskeutuminen alkaa, kun eläimen kyynärnivel taipuu ja laskeutuu (ennen maahan "
+            "kosketusta). Liike päättyy, kun takapuoli on maassa ja etujalka on vedetty alta."
+        ),
+    },
+    {
+        "id": "get_up",
+        "name_fi": "Ylös nouseminen",
+        "description_fi": (
+            "Ylös nouseminen alkaa eläimen kohottaessa päätään ja jännittäessä etuosan lihaksia, "
+            "päätä heilauttaen eteen ja nostaen takapäätä; lopuksi eläin nousee seisomaan."
+        ),
+    },
+    {
+        "id": "abnormal_motion",
+        "name_fi": "Epänormaalit liikesarjat",
+        "description_fi": (
+            "Epänormaali laskeutuminen (takapää ensin, istuva asento) tai nouseminen "
+            "(etujalat ensin, istuvasta ponnistus)."
+        ),
+    },
+    {
+        "id": "lying",
+        "name_fi": "Makaa",
+        "description_fi": (
+            "Eläimen vartalo lepää maassa alemmanpuoleisen takajalan ja reiden, vatsan ja "
+            "etujalkojen tai toisen kyljen varassa."
+        ),
+    },
+    {
+        "id": "other_posture",
+        "name_fi": "Muu asento",
+        "description_fi": "Esim. selkään hyppääminen, kaatuminen tai kompurointi.",
+    },
+    {
+        "id": NOT_VISIBLE_LABEL_ID,
+        "name_fi": "Ei näkyvissä",
+        "description_fi": "Eläin ei ole kuvassa (poistui ruudusta).",
+    },
+]
+
+VALID_BEHAVIOR_LABEL_IDS = {label["id"] for label in BEHAVIOR_LABELS}
+DEFAULT_BEHAVIOR_LABEL_ID = "stand"
+BEHAVIOR_FILE_NAME = "behavior_labels.json"
+
+
+def behavior_label_by_id(label_id: str) -> Dict[str, Any]:
+    for label in BEHAVIOR_LABELS:
+        if label["id"] == label_id:
+            return label
+    raise KeyError(label_id)
+
+
+def behavior_file_path(run_dir: Path) -> Path:
+    return run_dir / BEHAVIOR_FILE_NAME
+
+
+def empty_behavior_data(cow_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "segments": [],
+        "cow_ids": sorted(cow_ids or []),
+    }
+
+
+def load_behavior_data(run_dir: Path) -> Optional[Dict[str, Any]]:
+    path = behavior_file_path(run_dir)
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_behavior_data(run_dir: Path, data: Dict[str, Any]) -> None:
+    path = behavior_file_path(run_dir)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _validate_behavior_label_id(label_id: str) -> None:
+    if label_id not in VALID_BEHAVIOR_LABEL_IDS:
+        raise ValueError(f"Unknown label_id: {label_id}")
+
+
+def create_initial_segments(
+    cow_ids: List[int],
+    start_frame: int,
+    labels_by_cow: Dict[int, str],
+) -> Dict[str, Any]:
+    """One open-ended segment per cow starting at start_frame."""
+    segments: List[Dict[str, Any]] = []
+    for cow_id in sorted(cow_ids):
+        label_id = labels_by_cow.get(cow_id, DEFAULT_BEHAVIOR_LABEL_ID)
+        _validate_behavior_label_id(label_id)
+        segments.append(
+            {
+                "cow_id": int(cow_id),
+                "start_frame": int(start_frame),
+                "end_frame": None,
+                "label_id": label_id,
+                "visible": label_id != NOT_VISIBLE_LABEL_ID,
+            }
+        )
+    return empty_behavior_data(cow_ids) | {"segments": segments}
+
+
+def _close_open_behavior_segment(segments: List[Dict[str, Any]], cow_id: int, end_frame: int) -> None:
+    for seg in reversed(segments):
+        if seg["cow_id"] == cow_id and seg.get("end_frame") is None:
+            seg["end_frame"] = int(end_frame)
+            return
+
+
+def set_label_from_frame(
+    data: Dict[str, Any],
+    cow_id: int,
+    frame: int,
+    label_id: str,
+) -> Dict[str, Any]:
+    """
+    Close the current open segment for cow_id (if any) at frame-1, then start a new segment at frame.
+    """
+    _validate_behavior_label_id(label_id)
+    frame = int(frame)
+    cow_id = int(cow_id)
+    segments: List[Dict[str, Any]] = list(data.get("segments", []))
+
+    for seg in segments:
+        if seg["cow_id"] == cow_id and seg.get("end_frame") is None and seg["start_frame"] == frame:
+            seg["label_id"] = label_id
+            seg["visible"] = label_id != NOT_VISIBLE_LABEL_ID
+            data["segments"] = segments
+            if cow_id not in data.get("cow_ids", []):
+                data.setdefault("cow_ids", []).append(cow_id)
+                data["cow_ids"] = sorted(data["cow_ids"])
+            return data
+
+    if frame > 0:
+        _close_open_behavior_segment(segments, cow_id, frame - 1)
+
+    segments.append(
+        {
+            "cow_id": cow_id,
+            "start_frame": frame,
+            "end_frame": None,
+            "label_id": label_id,
+            "visible": label_id != NOT_VISIBLE_LABEL_ID,
+        }
+    )
+    data["segments"] = segments
+    cow_ids_set = set(data.get("cow_ids", []))
+    cow_ids_set.add(cow_id)
+    data["cow_ids"] = sorted(cow_ids_set)
+    return data
+
+
+def get_behavior_label_at_frame(data: Dict[str, Any], cow_id: int, frame: int) -> Optional[str]:
+    frame = int(frame)
+    cow_id = int(cow_id)
+    best: Optional[Dict[str, Any]] = None
+    for seg in data.get("segments", []):
+        if seg["cow_id"] != cow_id:
+            continue
+        start = int(seg["start_frame"])
+        end = seg.get("end_frame")
+        if frame < start:
+            continue
+        if end is not None and frame > int(end):
+            continue
+        if best is None or start >= int(best["start_frame"]):
+            best = seg
+    return best["label_id"] if best else None
+
+
+def labels_at_frame(data: Dict[str, Any], frame: int) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    for cow_id in data.get("cow_ids", []):
+        label = get_behavior_label_at_frame(data, int(cow_id), frame)
+        if label is not None:
+            out[int(cow_id)] = label
+    return out
+
+
+def behavior_name_fi_at_frame(run_dir: Path, cow_id: int, frame_idx: int) -> Optional[str]:
+    if get_annotation_mode(run_dir) != "behavior":
+        return None
+    data = load_behavior_data(run_dir)
+    if not data:
+        return None
+    label_id = get_behavior_label_at_frame(data, cow_id, frame_idx)
+    if not label_id:
+        return None
+    try:
+        return behavior_label_by_id(label_id)["name_fi"]
+    except KeyError:
+        return label_id
+
+
+_UNICODE_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+]
+
+
+def _load_unicode_font(size_px: int) -> ImageFont.ImageFont:
+    for path in _UNICODE_FONT_PATHS:
+        p = Path(path)
+        if p.exists():
+            try:
+                return ImageFont.truetype(str(p), size_px)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _draw_unicode_text_on_bgr(
+    frame_bgr: np.ndarray,
+    text: str,
+    center_x: int,
+    top_y: int,
+    font_px: int = 15,
+    fill_rgb: Tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    if not text:
+        return frame_bgr
+    pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    font = _load_unicode_font(font_px)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    x = int(center_x - text_w / 2)
+    y = int(top_y)
+    draw.text((x, y), text, font=font, fill=fill_rgb)
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+
+def draw_cow_overlay_with_behavior(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    cow_id: int,
+    color: Tuple[int, int, int],
+    behavior_name_fi: Optional[str] = None,
+    overlay_alpha: float = 0.4,
+    id_font_scale: float = 0.8,
+) -> np.ndarray:
+    """Draw mask tint, cow ID, and optional behaviour label below the ID."""
+    if not mask.any():
+        return frame
+
+    overlay = frame.copy()
+    overlay[mask] = color
+    frame = cv2.addWeighted(frame, 1.0 - overlay_alpha, overlay, overlay_alpha, 0)
+
+    ys, xs = np.where(mask)
+    cx, cy = int(xs.mean()), int(ys.mean())
+
+    id_text = str(cow_id)
+    thickness = 2
+    (id_w, id_h), baseline = cv2.getTextSize(
+        id_text, cv2.FONT_HERSHEY_SIMPLEX, id_font_scale, thickness
+    )
+    line_gap = 4
+    stack_h = id_h + (18 if behavior_name_fi else 0)
+    id_y = cy + id_h // 2 - stack_h // 2 + id_h
+    id_x = cx - id_w // 2
+
+    cv2.putText(
+        frame,
+        id_text,
+        (id_x, id_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        id_font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    if behavior_name_fi:
+        behavior_top = id_y + line_gap
+        frame = _draw_unicode_text_on_bgr(frame, behavior_name_fi, cx, behavior_top, font_px=15)
+
+    return frame
+
+
+def rebuild_golden_preview_video(run_dir: Path) -> bool:
+    """Re-render golden_preview.mp4 from committed golden frames (includes behaviour overlays)."""
+    meta_path = run_dir / "meta.txt"
+    if not meta_path.exists():
+        return False
+    meta = parse_meta_file(meta_path)
+    fps = float(meta["fps"])
+    n_ids = int(meta.get("ids", 0) or 0)
+    n_total = int(meta["frames"])
+    if n_ids < 1:
+        return False
+
+    _, _, max_idx = golden_progress(run_dir, n_total)
+    if max_idx is None:
+        return False
+
+    golden_preview = run_dir / "golden" / "golden_preview.mp4"
+    tmp_out = run_dir / "golden" / "golden_preview_rebuild_tmp.mp4"
+    ensure_dir(golden_preview.parent)
+
+    log.info(f"[GOLDEN_PREVIEW] Rebuilding 0..{max_idx} for run {run_dir.name}")
+    _render_segment_from_golden(run_dir, fps, n_ids, 0, int(max_idx), tmp_out)
+    if not tmp_out.exists() or tmp_out.stat().st_size == 0:
+        log.error("[GOLDEN_PREVIEW] Rebuild produced empty output")
+        return False
+
+    golden_preview_tmp = run_dir / "golden" / "golden_preview_tmp.mp4"
+    if _ffmpeg_reencode_video(tmp_out, golden_preview_tmp, fps):
+        golden_preview_tmp.replace(golden_preview)
+    else:
+        tmp_out.replace(golden_preview)
+    if tmp_out.exists():
+        tmp_out.unlink()
+    log.info(f"[GOLDEN_PREVIEW] Rebuild complete: {golden_preview}")
+    return True
 
 
 def masks_to_label_map(masks_bool):
@@ -1125,7 +1499,16 @@ def find_xmem_pngs(xmem_output: Path):
     return found
 
 
-def render_video(jpeg_dir: Path, frames, found_pngs, out_video: Path, fps: float, n_ids: int):
+def render_video(
+    jpeg_dir: Path,
+    frames,
+    found_pngs,
+    out_video: Path,
+    fps: float,
+    n_ids: int,
+    run_dir: Optional[Path] = None,
+    behavior_frame_offset: int = 0,
+):
     """
     Render all provided frames list (same length as found_pngs ideally).
     Uses direct ffmpeg encoding from processed frame images (faster, more reliable).
@@ -1141,6 +1524,7 @@ def render_video(jpeg_dir: Path, frames, found_pngs, out_video: Path, fps: float
 
     out_video.parent.mkdir(parents=True, exist_ok=True)
     colors = {i: random_color(i) for i in range(1, n_ids + 1)}
+    draw_behavior = run_dir is not None and get_annotation_mode(run_dir) == "behavior"
 
     T = min(len(frames), len(found_pngs))
     
@@ -1154,38 +1538,20 @@ def render_video(jpeg_dir: Path, frames, found_pngs, out_video: Path, fps: float
             if frame is None:
                 raise RuntimeError(f"Could not read frame {frames[t]}")
             mask = np.array(Image.open(found_pngs[t]))
+            try:
+                abs_frame_idx = int(Path(frames[t]).stem) + int(behavior_frame_offset)
+            except ValueError:
+                abs_frame_idx = t + int(behavior_frame_offset)
 
             for cid, col in colors.items():
                 m = (mask == cid)
                 if not m.any():
                     continue
-
-                overlay = frame.copy()
-                overlay[m] = col
-                frame = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
-
-                ys, xs = np.where(m)
-                cx, cy = int(xs.mean()), int(ys.mean())
-                
-                # Get text size to center it properly
-                text = str(cid)
-                font_scale = 0.8
-                thickness = 2
-                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                
-                # Center the text (putText uses bottom-left corner, so adjust)
-                text_x = cx - text_width // 2
-                text_y = cy + text_height // 2
-                
-                cv2.putText(
-                    frame,
-                    text,
-                    (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    (255, 255, 255),
-                    thickness,
-                    cv2.LINE_AA,
+                behavior_name = None
+                if draw_behavior:
+                    behavior_name = behavior_name_fi_at_frame(run_dir, cid, abs_frame_idx)
+                frame = draw_cow_overlay_with_behavior(
+                    frame, m, cid, col, behavior_name_fi=behavior_name
                 )
 
             # Write processed frame to temp directory (use quality 85 for faster I/O)
@@ -1268,6 +1634,7 @@ def _render_segment_from_golden(run_dir: Path, fps: float, n_ids: int, start_idx
         out_video=out_path,
         fps=fps,
         n_ids=n_ids,
+        run_dir=run_dir,
     )
     log.info(f"[RENDER_GOLDEN] Segment rendering complete: {out_path}")
 
@@ -1420,6 +1787,7 @@ def prepare(video_path: str):
         f"fps={fps}\n"
         f"frames={len(frames)}\n"
         f"ids=0\n"
+        f"annotation_mode=standard\n"
     )
 
     source_url = f"/source/{run_id}"
@@ -1490,6 +1858,7 @@ def _do_frame_extraction(run_id: str, video_path: Path, jpeg_dir: Path, run_dir:
             f"fps={fps}\n"
             f"frames={len(frames)}\n"
             f"ids=0\n"
+            f"annotation_mode=standard\n"
         )
 
         # Mark as completed but keep it for a bit so frontend can see it
@@ -1773,6 +2142,21 @@ class IDMapping(BaseModel):
     mapping: Dict[str, int]
 
 
+class ApplyInitPayload(BaseModel):
+    mapping: Dict[str, int]
+    behavior_by_cow_id: Optional[Dict[str, str]] = None
+
+
+class AnnotationModePayload(BaseModel):
+    mode: str
+
+
+class BehaviorSetLabelPayload(BaseModel):
+    cow_id: int
+    frame: int
+    label_id: str
+
+
 class PreviewUpdate(BaseModel):
     mapping: Dict[str, int]  # mask_index -> final_id (0 means delete)
 
@@ -1965,13 +2349,106 @@ def preview_init_update(run_id: str, preview_update: PreviewUpdate):
     })
 
 
+@app.get("/behavior/labels")
+def list_behavior_labels():
+    return {"labels": BEHAVIOR_LABELS}
+
+
+@app.post("/run/{run_id}/annotation_mode")
+def set_annotation_mode(run_id: str, payload: AnnotationModePayload):
+    mode = (payload.mode or "").strip().lower()
+    if mode not in ("standard", "behavior"):
+        raise HTTPException(400, "mode must be 'standard' or 'behavior'")
+    run_dir = RUNS_ROOT / run_id
+    meta_path = run_dir / "meta.txt"
+    if not meta_path.exists():
+        raise HTTPException(404, "run_id not found (missing meta.txt)")
+    update_meta_key(meta_path, "annotation_mode", mode)
+    log.info(f"[ANNOTATION_MODE] run_id={run_id} mode={mode}")
+    return {"run_id": run_id, "annotation_mode": mode}
+
+
+@app.get("/behavior/{run_id}")
+def get_behavior(run_id: str, frame: Optional[int] = Query(None)):
+    run_dir = RUNS_ROOT / run_id
+    if not (run_dir / "meta.txt").exists():
+        raise HTTPException(404, "run_id not found")
+    data = load_behavior_data(run_dir)
+    mode = get_annotation_mode(run_dir)
+    result = {
+        "run_id": run_id,
+        "annotation_mode": mode,
+        "labels": BEHAVIOR_LABELS,
+        "segments": [],
+        "cow_ids": [],
+        "labels_at_frame": {},
+    }
+    if data:
+        result["segments"] = data.get("segments", [])
+        result["cow_ids"] = data.get("cow_ids", [])
+        if frame is not None:
+            result["labels_at_frame"] = {
+                str(k): v for k, v in labels_at_frame(data, int(frame)).items()
+            }
+    return result
+
+
+@app.post("/behavior/{run_id}/set_label")
+def behavior_set_label(run_id: str, payload: BehaviorSetLabelPayload):
+    run_dir = RUNS_ROOT / run_id
+    if not (run_dir / "meta.txt").exists():
+        raise HTTPException(404, "run_id not found")
+    if get_annotation_mode(run_dir) != "behavior":
+        raise HTTPException(400, "Run is not in behavior annotation mode")
+    data = load_behavior_data(run_dir)
+    if not data:
+        raise HTTPException(400, "No behavior data for this run; complete ID assignment first")
+    if payload.frame < 0:
+        raise HTTPException(400, "frame must be >= 0")
+    try:
+        set_label_from_frame(data, payload.cow_id, payload.frame, payload.label_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    save_behavior_data(run_dir, data)
+    log.info(
+        f"[BEHAVIOR] set_label run_id={run_id} cow_id={payload.cow_id} "
+        f"frame={payload.frame} label={payload.label_id}"
+    )
+    preview_rebuilt = rebuild_golden_preview_video(run_dir)
+    return {
+        "run_id": run_id,
+        "cow_id": payload.cow_id,
+        "frame": payload.frame,
+        "label_id": payload.label_id,
+        "preview_rebuilt": preview_rebuilt,
+        "label_at_frame": {
+            str(k): v for k, v in labels_at_frame(data, payload.frame).items()
+        },
+    }
+
+
+@app.post("/golden/{run_id}/rebuild_preview")
+def golden_rebuild_preview(run_id: str):
+    """Re-render golden preview video (e.g. after behaviour label changes or legacy runs)."""
+    run_dir = RUNS_ROOT / run_id
+    if not (run_dir / "meta.txt").exists():
+        raise HTTPException(404, "run_id not found")
+    if get_annotation_mode(run_dir) != "behavior":
+        return {"run_id": run_id, "preview_rebuilt": False, "message": "Not in behavior mode"}
+    ok = rebuild_golden_preview_video(run_dir)
+    if not ok:
+        raise HTTPException(500, "Failed to rebuild golden preview")
+    return {"run_id": run_id, "preview_rebuilt": True}
+
+
 @app.post("/apply_init_ids/{run_id}")
-def apply_init_ids(run_id: str, id_mapping: IDMapping):
+def apply_init_ids(run_id: str, payload: ApplyInitPayload):
     """
     Apply user's ID mapping to frame 0 masks and complete initialization.
     This creates the annotation file, golden folder, and preview video.
+  Optional behavior_by_cow_id (cow_id str -> label_id) for behavior annotation mode.
     """
-    log.info(f"/apply_init_ids run_id={run_id} mapping={id_mapping.mapping}")
+    log.info(f"/apply_init_ids run_id={run_id} mapping={payload.mapping}")
     
     run_dir = RUNS_ROOT / run_id
     
@@ -1993,7 +2470,7 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     H, W = masks[0].shape
     label_map = np.zeros((H, W), dtype=np.uint8)
     
-    for mask_idx_str, final_id in id_mapping.mapping.items():
+    for mask_idx_str, final_id in payload.mapping.items():
         mask_idx = int(mask_idx_str)
         final_id = int(final_id)
         if final_id <= 0:  # Skip deleted masks
@@ -2016,6 +2493,24 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     ensure_dir(golden_jpeg_dir)
     shutil.copy2(jpeg_dir / "00000.jpg", golden_jpeg_dir / "00000.jpg")
     
+    # Update metadata with final n_ids (before preview render)
+    meta_content = meta_path.read_text()
+    meta_path.write_text(meta_content.replace("ids=0", f"ids={n_ids}"))
+
+    # Behaviour labels: initial segments at frame 0 (before preview so labels appear on video)
+    if get_annotation_mode(run_dir) == "behavior":
+        cow_ids = sorted({int(v) for v in payload.mapping.values() if int(v) > 0})
+        labels_by_cow: Dict[int, str] = {}
+        if payload.behavior_by_cow_id:
+            for cow_key, label_id in payload.behavior_by_cow_id.items():
+                labels_by_cow[int(cow_key)] = label_id
+        for cow_id in cow_ids:
+            if cow_id not in labels_by_cow:
+                labels_by_cow[cow_id] = DEFAULT_BEHAVIOR_LABEL_ID
+        behavior_data = create_initial_segments(cow_ids, 0, labels_by_cow)
+        save_behavior_data(run_dir, behavior_data)
+        log.info(f"[APPLY_INIT_IDS] Saved behavior segments for cows={cow_ids}")
+
     # Initialize golden preview video with frame0
     seg0 = run_dir / "golden_segments" / "00000_00000.mp4"
     ensure_dir(seg0.parent)
@@ -2030,13 +2525,9 @@ def apply_init_ids(run_id: str, id_mapping: IDMapping):
     if _ffmpeg_reencode_video(golden_preview_init, golden_preview_tmp, fps):
         golden_preview_tmp.replace(golden_preview_init)
     
-    # Update metadata with final n_ids
-    meta_content = meta_path.read_text()
-    meta_path.write_text(meta_content.replace("ids=0", f"ids={n_ids}"))
-    
     # Clean up temporary masks file
     masks_file.unlink()
-    
+
     log.info(f"[APPLY_INIT_IDS] Initialization complete: run_id={run_id}, n_ids={n_ids}")
     return {"run_id": run_id, "n_ids": n_ids}
 
@@ -2524,6 +3015,8 @@ def track(run_id: str, n_frames: int, auto_reset_interval: Optional[int] = Query
         out_video=run_dir / "tracked.mp4",
         fps=fps,
         n_ids=n_ids,
+        run_dir=run_dir,
+        behavior_frame_offset=seed_idx,
     )
 
     tracked_path = run_dir / "tracked.mp4"
@@ -3116,6 +3609,7 @@ def progress(run_id: str):
         "golden_max_idx": max_idx,
         "last_chunk_seed_idx": seed_idx,  # For calculating absolute frame from tracked video
         "last_chunk_frames": chunk_frames,  # Number of frames in current tracked video
+        "annotation_mode": get_annotation_mode(run_dir),
     }
 
 
@@ -5495,11 +5989,15 @@ def download_golden(run_id: str, background_tasks: BackgroundTasks):
     
     # Create zip file with golden folder contents
     log.info(f"[DOWNLOAD_GOLDEN] Creating zip file: {zip_path}")
+    behavior_path = run_dir / "behavior_labels.json"
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for file_path in golden_root.rglob('*'):
             if file_path.is_file():
                 arcname = file_path.relative_to(golden_root)
                 zipf.write(file_path, arcname)
+        if behavior_path.is_file():
+            zipf.write(behavior_path, "behavior_labels.json")
+            log.info(f"[DOWNLOAD_GOLDEN] Included {behavior_path.name} in zip")
     
     log.info(f"[DOWNLOAD_GOLDEN] Zip file created: {zip_path} ({zip_path.stat().st_size} bytes)")
     

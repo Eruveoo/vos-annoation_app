@@ -8,7 +8,15 @@ import React, { useState, useRef, useEffect } from "react";
  * @param {number} progress - Optional progress percentage (0-100)
  * @param {string} progressMessage - Optional progress message
  */
-export default function VideoPlayer({ videoUrl, label, height = 480, progress = null, progressMessage = null }) {
+export default function VideoPlayer({
+  videoUrl,
+  label,
+  height = 480,
+  progress = null,
+  progressMessage = null,
+  fps = null,
+  onPlaybackFrame = null,
+}) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const videoRef = useRef(null);
@@ -19,6 +27,23 @@ export default function VideoPlayer({ videoUrl, label, height = 480, progress = 
       setError(null);
     }
   }, [videoUrl]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !fps || !onPlaybackFrame) return;
+
+    const handleTimeUpdate = () => {
+      const frameIdx = Math.max(0, Math.floor(video.currentTime * fps));
+      onPlaybackFrame(frameIdx);
+    };
+
+    video.addEventListener("timeupdate", handleTimeUpdate);
+    video.addEventListener("seeked", handleTimeUpdate);
+    return () => {
+      video.removeEventListener("timeupdate", handleTimeUpdate);
+      video.removeEventListener("seeked", handleTimeUpdate);
+    };
+  }, [videoUrl, fps, onPlaybackFrame]);
 
   const handleCanPlay = () => {
     setLoading(false);

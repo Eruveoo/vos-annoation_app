@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import VideoPlayer from "../VideoPlayer.jsx";
-import { prepareUploadVideo, getProgress, getSourceVideoUrl, initSam } from "../api.js";
+import { prepareUploadVideo, getProgress, getSourceVideoUrl, initSam, setAnnotationMode } from "../api.js";
+import { ANNOTATION_MODES } from "../behaviorLabels.js";
 
 export default function VideoSelectionPage({
   onVideoLoaded,
@@ -8,6 +9,8 @@ export default function VideoSelectionPage({
   onResumeSession,
   connectionStatus,
   defaultResumeRunId = "",
+  annotationMode = ANNOTATION_MODES.STANDARD,
+  onAnnotationModeChange,
 }) {
   const [loading, setLoading] = useState(false);
   const [initLoading, setInitLoading] = useState(false);
@@ -25,6 +28,15 @@ export default function VideoSelectionPage({
   useEffect(() => {
     setResumeRunId(defaultResumeRunId || "");
   }, [defaultResumeRunId]);
+
+  // Keep server meta in sync when user toggles mode after upload
+  useEffect(() => {
+    const rid = videoInfo?.runId;
+    if (!rid) return;
+    setAnnotationMode(rid, annotationMode).catch((e) => {
+      console.warn("[VideoSelectionPage] annotation mode sync failed:", e);
+    });
+  }, [annotationMode, videoInfo?.runId]);
 
   const handleUploadFile = async (file) => {
     if (!file) return;
@@ -55,7 +67,17 @@ export default function VideoSelectionPage({
       setUploadProgress(100);
       setUploadMessage("Completed");
 
-      onVideoLoaded?.({ videoPath: result.uploaded_filename || file.name, runId: result.run_id });
+      try {
+        await setAnnotationMode(result.run_id, annotationMode);
+      } catch (modeErr) {
+        console.warn("[VideoSelectionPage] Could not set annotation mode:", modeErr);
+      }
+
+      onVideoLoaded?.({
+        videoPath: result.uploaded_filename || file.name,
+        runId: result.run_id,
+        annotationMode,
+      });
     } catch (e) {
       setError(`Failed to upload video: ${e.message}`);
       setUploadProgress(0);
@@ -108,6 +130,10 @@ export default function VideoSelectionPage({
         runId: prog.run_id || rid,
       });
       setVideoUrl(getSourceVideoUrl(rid) + `?t=${Date.now()}`);
+
+      if (prog.annotation_mode && onAnnotationModeChange) {
+        onAnnotationModeChange(prog.annotation_mode);
+      }
 
       onResumeSession?.(rid);
     } catch (e) {
@@ -198,6 +224,65 @@ export default function VideoSelectionPage({
             }}>
               Upload Video
             </h1>
+          </div>
+
+          {/* Annotation mode */}
+          <div
+            style={{
+              marginBottom: 20,
+              padding: 16,
+              borderRadius: 12,
+              border: "1px solid #e9ecef",
+              background: "#f8f9fa",
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 10, color: "#495057" }}>
+              ANNOTATION MODE
+            </div>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <label
+                style={{
+                  flex: "1 1 200px",
+                  padding: 12,
+                  borderRadius: 10,
+                  border: `2px solid ${annotationMode === ANNOTATION_MODES.STANDARD ? "#0d6efd" : "#dee2e6"}`,
+                  background: annotationMode === ANNOTATION_MODES.STANDARD ? "#e7f1ff" : "#fff",
+                  cursor: "pointer",
+                  fontSize: 13,
+                }}
+              >
+                <input
+                  type="radio"
+                  name="annotationMode"
+                  checked={annotationMode === ANNOTATION_MODES.STANDARD}
+                  onChange={() => onAnnotationModeChange?.(ANNOTATION_MODES.STANDARD)}
+                  style={{ marginRight: 8 }}
+                />
+                <strong>Standard VOS</strong>
+                <div style={{ color: "#6c757d", marginTop: 4 }}>Masks and tracking only (current workflow).</div>
+              </label>
+              <label
+                style={{
+                  flex: "1 1 200px",
+                  padding: 12,
+                  borderRadius: 10,
+                  border: `2px solid ${annotationMode === ANNOTATION_MODES.BEHAVIOR ? "#0d6efd" : "#dee2e6"}`,
+                  background: annotationMode === ANNOTATION_MODES.BEHAVIOR ? "#e7f1ff" : "#fff",
+                  cursor: "pointer",
+                  fontSize: 13,
+                }}
+              >
+                <input
+                  type="radio"
+                  name="annotationMode"
+                  checked={annotationMode === ANNOTATION_MODES.BEHAVIOR}
+                  onChange={() => onAnnotationModeChange?.(ANNOTATION_MODES.BEHAVIOR)}
+                  style={{ marginRight: 8 }}
+                />
+                <strong>Behaviour annotation</strong>
+                <div style={{ color: "#6c757d", marginTop: 4 }}>Masks + behaviour labels per cow.</div>
+              </label>
+            </div>
           </div>
 
           {/* Resume session */}

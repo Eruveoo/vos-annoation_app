@@ -3,6 +3,7 @@ import VideoSelectionPage from "./pages/VideoSelectionPage.jsx";
 import IDAssignmentPage from "./pages/IDAssignmentPage.jsx";
 import MainWorkspacePage from "./pages/MainWorkspacePage.jsx";
 import { testConnection, applyInitIds, getProgress } from "./api.js";
+import { ANNOTATION_MODES } from "./behaviorLabels.js";
 
 export default function App() {
   // Page navigation state
@@ -13,6 +14,9 @@ export default function App() {
 
   // Video selection state
   const [videoPath, setVideoPath] = useState("video_sample_5_min.mp4");
+
+  // Annotation mode: standard VOS vs behaviour labelling
+  const [annotationMode, setAnnotationMode] = useState(ANNOTATION_MODES.STANDARD);
 
   // Initialize state
   const [runId, setRunId] = useState(null);
@@ -55,11 +59,17 @@ export default function App() {
   }, []);
 
   // Handle video prepared - go to initialize page
-  const handleVideoLoaded = ({ videoPath: path, runId: preparedRunId }) => {
+  const handleVideoLoaded = ({ videoPath: path, runId: preparedRunId, annotationMode: mode }) => {
     setVideoPath(path);
     setRunId(preparedRunId);
-    // Stay on the same page; user can initialize SAM directly from video selection.
+    if (mode) {
+      setAnnotationMode(mode);
+    }
     setCurrentPage("video-selection");
+  };
+
+  const handleAnnotationModeChange = (mode) => {
+    setAnnotationMode(mode);
   };
 
   // Handle initialized - go to ID assignment page
@@ -79,7 +89,7 @@ export default function App() {
   };
 
   // Handle IDs applied - go to main workspace
-  const handleIdsApplied = async (mapping) => {
+  const handleIdsApplied = async (mapping, behaviorByCowId = null) => {
     if (!runId) {
       return;
     }
@@ -98,7 +108,7 @@ export default function App() {
     }
 
     try {
-      await applyInitIds(runId, validMapping);
+      await applyInitIds(runId, validMapping, behaviorByCowId);
       
       // Refresh progress after initialization
       const prog = await getProgress(runId);
@@ -110,6 +120,9 @@ export default function App() {
         lastChunkSeedIdx: prog.last_chunk_seed_idx || null,
         goldenMaxIdx: prog.golden_max_idx !== null && prog.golden_max_idx !== undefined ? prog.golden_max_idx : null,
       });
+      if (prog.annotation_mode) {
+        setAnnotationMode(prog.annotation_mode);
+      }
       
       // Go to main workspace
       setCurrentPage("main-workspace");
@@ -128,17 +141,17 @@ export default function App() {
       // ignore
     }
 
-    // Decide where to navigate based on whether golden exists (initialized sessions have golden_max_idx != null)
     try {
       const prog = await getProgress(rid);
+      if (prog.annotation_mode) {
+        setAnnotationMode(prog.annotation_mode);
+      }
       if (prog.golden_max_idx !== null && prog.golden_max_idx !== undefined) {
         setCurrentPage("main-workspace");
       } else {
-        // Session exists but not initialized yet; stay on upload page so user can run init SAM.
         setCurrentPage("video-selection");
       }
     } catch {
-      // If progress fails, still keep user on video selection (VideoSelectionPage will show error)
       setCurrentPage("video-selection");
     }
   };
@@ -153,6 +166,8 @@ export default function App() {
           onResumeSession={handleResumeSession}
           connectionStatus={connectionStatus}
           defaultResumeRunId={resumeRunId}
+          annotationMode={annotationMode}
+          onAnnotationModeChange={handleAnnotationModeChange}
         />
       );
 
@@ -162,6 +177,7 @@ export default function App() {
           runId={runId}
           frame0Image={frame0Image}
           maskAssignments={maskAssignments}
+          annotationMode={annotationMode}
           onIdsApplied={handleIdsApplied}
           onBack={() => setCurrentPage("video-selection")}
         />
@@ -172,6 +188,7 @@ export default function App() {
         <MainWorkspacePage
           runId={runId}
           frame0Image={frame0Image}
+          annotationMode={annotationMode}
           onProgressUpdate={(prog) => {
             setProgress({
               processed: prog.golden_processed,
@@ -181,6 +198,9 @@ export default function App() {
               lastChunkSeedIdx: prog.last_chunk_seed_idx || null,
               goldenMaxIdx: prog.golden_max_idx !== null && prog.golden_max_idx !== undefined ? prog.golden_max_idx : null,
             });
+            if (prog.annotation_mode) {
+              setAnnotationMode(prog.annotation_mode);
+            }
           }}
         />
       );

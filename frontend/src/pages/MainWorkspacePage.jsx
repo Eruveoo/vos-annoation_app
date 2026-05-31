@@ -10,9 +10,13 @@ import {
   getTrackedVideoUrl,
   getGoldenVideoUrl,
   downloadGolden,
+  rebuildGoldenPreview,
 } from "../api.js";
+import BehaviorEditor from "../BehaviorEditor.jsx";
+import { ANNOTATION_MODES } from "../behaviorLabels.js";
 
-export default function MainWorkspacePage({ runId, frame0Image, onProgressUpdate }) {
+export default function MainWorkspacePage({ runId, frame0Image, annotationMode, onProgressUpdate }) {
+  const isBehaviorMode = annotationMode === ANNOTATION_MODES.BEHAVIOR;
   const [activeTab, setActiveTab] = useState("tracking"); // Default to tracking
   const [nFrames, setNFrames] = useState(50);
   const [autoResetInterval, setAutoResetInterval] = useState("");
@@ -21,6 +25,8 @@ export default function MainWorkspacePage({ runId, frame0Image, onProgressUpdate
   const [success, setSuccess] = useState("");
   const [trackedVideoUrl, setTrackedVideoUrl] = useState(null);
   const [goldenVideoUrl, setGoldenVideoUrl] = useState(null);
+  const [goldenPlaybackFrame, setGoldenPlaybackFrame] = useState(0);
+  const [rebuildingPreview, setRebuildingPreview] = useState(false);
   const [trackProgress, setTrackProgress] = useState(0);
   const [trackMessage, setTrackMessage] = useState("");
   const [isTracking, setIsTracking] = useState(false);
@@ -125,6 +131,45 @@ export default function MainWorkspacePage({ runId, frame0Image, onProgressUpdate
     }
   };
 
+  const refreshGoldenVideo = () => {
+    if (runId) {
+      setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
+    }
+  };
+
+  const handleBehaviorLabelUpdated = async () => {
+    setRebuildingPreview(true);
+    try {
+      refreshGoldenVideo();
+    } finally {
+      setTimeout(() => setRebuildingPreview(false), 800);
+    }
+  };
+
+  const handleRebuildGoldenPreview = async () => {
+    if (!runId) return;
+    setRebuildingPreview(true);
+    setError("");
+    try {
+      await rebuildGoldenPreview(runId);
+      refreshGoldenVideo();
+      setSuccess("Golden preview updated with behaviour labels.");
+    } catch (e) {
+      setError(`Failed to rebuild golden preview: ${e.message}`);
+    } finally {
+      setRebuildingPreview(false);
+    }
+  };
+
+  const behaviorEditorProps = {
+    runId,
+    defaultFrame: progress.goldenMaxIdx ?? 0,
+    maxFrame: progress.goldenMaxIdx,
+    videoFrame: goldenPlaybackFrame,
+    onLabelUpdated: handleBehaviorLabelUpdated,
+    rebuildingPreview,
+  };
+
   const handleDownloadGolden = async () => {
     setBusy(true);
     setError("");
@@ -164,6 +209,21 @@ export default function MainWorkspacePage({ runId, frame0Image, onProgressUpdate
       >
         <div>
           <strong>Run ID:</strong> <code>{runId}</code>
+          {isBehaviorMode && (
+            <span
+              style={{
+                marginLeft: 12,
+                padding: "2px 10px",
+                borderRadius: 999,
+                backgroundColor: "#fff3cd",
+                color: "#856404",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+            >
+              Behaviour mode
+            </span>
+          )}
         </div>
         <div>
           <strong>FPS:</strong> {progress.fps || "N/A"} | <strong>Total Frames:</strong> {progress.total || "N/A"}
@@ -337,9 +397,38 @@ export default function MainWorkspacePage({ runId, frame0Image, onProgressUpdate
                 />
               </div>
               <div>
-                <VideoPlayer videoUrl={goldenVideoUrl} label="Golden preview (committed so far)" height={480} />
+                <VideoPlayer
+                  videoUrl={goldenVideoUrl}
+                  label="Golden preview (committed so far)"
+                  height={480}
+                  fps={progress.fps}
+                  onPlaybackFrame={isBehaviorMode ? setGoldenPlaybackFrame : null}
+                />
               </div>
             </div>
+
+            {isBehaviorMode && runId && goldenVideoUrl && (
+              <>
+                <BehaviorEditor {...behaviorEditorProps} />
+                <button
+                  type="button"
+                  onClick={handleRebuildGoldenPreview}
+                  disabled={busy || rebuildingPreview}
+                  style={{
+                    marginTop: 8,
+                    padding: "8px 14px",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    border: "1px solid #6c757d",
+                    borderRadius: 8,
+                    background: "#fff",
+                    cursor: busy || rebuildingPreview ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {rebuildingPreview ? "Rebuilding preview…" : "Rebuild golden preview (refresh labels on video)"}
+                </button>
+              </>
+            )}
 
             {/* Corrections section */}
             <div style={{ marginTop: 48, paddingTop: 32, borderTop: "2px solid #dee2e6" }}>
@@ -367,12 +456,43 @@ export default function MainWorkspacePage({ runId, frame0Image, onProgressUpdate
           <div>
             <h2 style={{ marginTop: 0, marginBottom: 24 }}>Golden Preview</h2>
             <div style={{ marginBottom: 24 }}>
-              <VideoPlayer videoUrl={goldenVideoUrl} label="Golden video (all committed frames)" height={600} />
+              <VideoPlayer
+                videoUrl={goldenVideoUrl}
+                label="Golden video (all committed frames)"
+                height={600}
+                fps={progress.fps}
+                onPlaybackFrame={isBehaviorMode ? setGoldenPlaybackFrame : null}
+              />
             </div>
+            {isBehaviorMode && runId && (
+              <>
+                <BehaviorEditor {...behaviorEditorProps} />
+                <button
+                  type="button"
+                  onClick={handleRebuildGoldenPreview}
+                  disabled={busy || rebuildingPreview}
+                  style={{
+                    marginTop: 8,
+                    marginBottom: 16,
+                    padding: "8px 14px",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    border: "1px solid #6c757d",
+                    borderRadius: 8,
+                    background: "#fff",
+                    cursor: busy || rebuildingPreview ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {rebuildingPreview ? "Rebuilding preview…" : "Rebuild golden preview (refresh labels on video)"}
+                </button>
+              </>
+            )}
+
             <button
               onClick={handleDownloadGolden}
               disabled={busy || !runId || !goldenVideoUrl}
               style={{
+                marginTop: 24,
                 padding: "12px 24px",
                 fontSize: 16,
                 fontWeight: 600,
