@@ -1069,83 +1069,67 @@ PROCESSOR = None
 VIDEO_PREDICTOR = None
 
 
-def _ensure_sam3_assets():
-    """Patch pkg_resources to find SAM-3 BPE tokenizer file in correct location."""
+_SAM3_READY = False
+
+
+def _ensure_sam3_ready() -> None:
+    """Tokenizer path fix + SAM 3.1 addmm_act dtype patch (github.com/facebookresearch/sam3/issues/507)."""
+    global _SAM3_READY
     sam3_package_dir = Path(sam3.model_builder.__file__).parent
     bpe_file = sam3_package_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
     pkg_resources_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
     if not Path(pkg_resources_path).exists() and bpe_file.exists():
         original_fn = pkg_resources.resource_filename
+
         def patched_fn(package, resource):
             if package == "sam3" and "bpe_simple_vocab_16e6.txt.gz" in resource:
                 return str(bpe_file)
             return original_fn(package, resource)
+
         pkg_resources.resource_filename = patched_fn
 
+    if _SAM3_READY:
+        return
+    try:
+        from sam3.perflib import fused
 
-def _cast_module_float32(module: torch.nn.Module) -> torch.nn.Module:
-    """Force all floating-point weights/buffers to float32 (avoids bf16/float32 matmul errors)."""
-    module.eval()
-    module.float()
-    for param in module.parameters(recurse=True):
-        if param.data is not None and param.data.is_floating_point():
-            param.data = param.data.float()
-    for buf in module.buffers(recurse=True):
-        if buf.is_floating_point():
-            buf.data = buf.data.float()
-    return module
+        addmm_act_op = torch.ops.aten._addmm_activation
 
+        def addmm_act_fixed(activation, linear, mat1):
+            if torch.is_grad_enabled():
+                raise ValueError("Expected grad to be disabled.")
+            orig_dtype = mat1.dtype
+            bias = linear.bias.detach().to(torch.bfloat16)
+            mat1_bf = mat1.to(torch.bfloat16)
+            weight = linear.weight.detach().to(torch.bfloat16)
+            flat = mat1_bf.view(-1, mat1_bf.shape[-1])
+            use_gelu = activation in (torch.nn.functional.gelu, torch.nn.GELU)
+            if activation not in (
+                torch.nn.functional.relu,
+                torch.nn.ReLU,
+                torch.nn.functional.gelu,
+                torch.nn.GELU,
+            ):
+                raise ValueError(f"Unexpected activation {activation}")
+            y = addmm_act_op(bias, flat, weight.t(), beta=1, alpha=1, use_gelu=use_gelu)
+            return y.view(mat1_bf.shape[:-1] + (y.shape[-1],)).to(orig_dtype)
 
-def _is_sam3_dtype_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return (
-        "bfloat16" in msg
-        or "bf16" in msg
-        or ("dtype" in msg and "float" in msg)
-        or "bias type" in msg
-    )
-
-
-def _reset_sam3_image_model() -> None:
-    global MODEL, PROCESSOR
-    MODEL = None
-    PROCESSOR = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        fused.addmm_act = addmm_act_fixed
+        _SAM3_READY = True
+        log.info("[SAM3] Ready (addmm_act dtype patch applied)")
+    except Exception as e:
+        log.warning(f"[SAM3] addmm_act patch failed: {e}")
 
 
 def infer_sam3_text_prompt(processor: Sam3Processor, img: Image.Image, prompt: str) -> Dict[str, Any]:
-    """
-    Run SAM-3 text segmentation with autocast disabled and float32 weights.
-    Retries once after full model reload on BFloat16/float dtype mismatches.
-    """
-    global MODEL, PROCESSOR
-    last_err: Optional[BaseException] = None
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-
-    for attempt in range(2):
-        model = getattr(processor, "model", MODEL)
-        if model is not None:
-            _cast_module_float32(model)
-        try:
-            with torch.inference_mode():
-                with torch.autocast(device_type=device_type, enabled=False):
-                    state = processor.set_image(img)
-                    return processor.set_text_prompt(state=state, prompt=prompt)
-        except RuntimeError as e:
-            last_err = e
-            if _is_sam3_dtype_error(e) and attempt == 0:
-                log.warning(
-                    f"[SAM3] dtype mismatch on attempt {attempt + 1}, reloading model: {e}"
-                )
-                _reset_sam3_image_model()
-                processor = get_model()
-                continue
-            raise
-
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError("SAM-3 inference failed without a captured error")
+    """Text-prompt segmentation on one image."""
+    with torch.inference_mode():
+        if torch.cuda.is_available():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                state = processor.set_image(img)
+                return processor.set_text_prompt(state=state, prompt=prompt)
+        state = processor.set_image(img)
+        return processor.set_text_prompt(state=state, prompt=prompt)
 
 
 def get_model():
@@ -1153,31 +1137,26 @@ def get_model():
     if MODEL is None:
         log.info("Loading SAM-3 model...")
         t0 = time.perf_counter()
-        _ensure_sam3_assets()
+        _ensure_sam3_ready()
         MODEL = build_sam3_image_model()
-        _cast_module_float32(MODEL)
         PROCESSOR = Sam3Processor(MODEL)
-        log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s (float32)")
+        log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s")
     return PROCESSOR
 
 
 def get_video_predictor(force_reinit=False):
-    """Get SAM-3 video predictor for point-based refinement (1-frame video sessions)"""
+    """SAM-3 video predictor for point-based refinement (1-frame sessions)."""
     global VIDEO_PREDICTOR
     if VIDEO_PREDICTOR is None or force_reinit:
         if force_reinit and VIDEO_PREDICTOR is not None:
-            log.warning("[VIDEO_PREDICTOR] Forcing reinitialization due to error")
+            log.warning("[VIDEO_PREDICTOR] Reinitializing")
             VIDEO_PREDICTOR = None
         log.info("Loading SAM-3 video predictor...")
         t0 = time.perf_counter()
-        _ensure_sam3_assets()
+        _ensure_sam3_ready()
         gpu_ids = [torch.cuda.current_device()] if torch.cuda.is_available() else []
         VIDEO_PREDICTOR = build_sam3_video_predictor(gpus_to_use=gpu_ids)
-        if isinstance(VIDEO_PREDICTOR, torch.nn.Module):
-            _cast_module_float32(VIDEO_PREDICTOR)
-        elif hasattr(VIDEO_PREDICTOR, "float"):
-            VIDEO_PREDICTOR = VIDEO_PREDICTOR.float()
-        log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s (float32)")
+        log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s")
     return VIDEO_PREDICTOR
 
 
@@ -1690,62 +1669,36 @@ def auto_assign_ids(new_masks: list, prev_label_map, iou_threshold: float = 0.2,
     return assignments
 
 
-def run_sam3_on_frame(prompt: str, frame_path: Path) -> list:
-    """
-    Run SAM-3 on a specific frame and return list of boolean masks.
-    """
-    
-    log.info(f"SAM-3 on frame {frame_path}, prompt={prompt}")
-    processor = get_model()
-
-    img = Image.open(frame_path).convert("RGB")
-    W, H = img.size
-
-    out = infer_sam3_text_prompt(processor, img, prompt)
-    
-    log.info(f"SAM-3 raw masks: {len(out['masks'])}")
-    
-    masks = []
+def _masks_from_sam3_output(out: Dict[str, Any], width: int, height: int) -> List[np.ndarray]:
+    masks: List[np.ndarray] = []
     for m in out["masks"]:
         mask = m.squeeze().cpu().numpy()
-        mask = np.array(Image.fromarray(mask).resize((W, H), Image.NEAREST)) > MASK_THRESHOLD
+        mask = np.array(Image.fromarray(mask).resize((width, height), Image.NEAREST)) > MASK_THRESHOLD
         if mask.sum() > 500:
             masks.append(mask)
-    
+    return masks
+
+
+def run_sam3_on_frame(prompt: str, frame_path: Path) -> list:
+    """Run SAM-3 on a frame; return boolean masks."""
+    log.info(f"SAM-3 on frame {frame_path}, prompt={prompt}")
+    img = Image.open(frame_path).convert("RGB")
+    W, H = img.size
+    out = infer_sam3_text_prompt(get_model(), img, prompt)
+    log.info(f"SAM-3 raw masks: {len(out['masks'])}")
+    masks = _masks_from_sam3_output(out, W, H)
     if not masks:
         raise RuntimeError("No valid masks from SAM-3")
-    
     log.info(f"SAM-3 kept {len(masks)} masks")
     return masks
 
 
 def run_sam3_on_first_frame(prompt, jpeg_dir, ann_dir, frames):
-
-    log.info(f"SAM-3 on frame0, prompt={prompt}")
-    processor = get_model()
-
     first_path = jpeg_dir / frames[0]
-    img = Image.open(first_path).convert("RGB")
-    W, H = img.size
-
-    out = infer_sam3_text_prompt(processor, img, prompt)
-
-    log.info(f"SAM-3 raw masks: {len(out['masks'])}")
-
-    masks = []
-    for m in out["masks"]:
-        mask = m.squeeze().cpu().numpy()
-        mask = np.array(Image.fromarray(mask).resize((W, H), Image.NEAREST)) > MASK_THRESHOLD
-        if mask.sum() > 500:
-            masks.append(mask)
-
-    if not masks:
-        raise RuntimeError("No valid masks from SAM-3")
-
+    masks = run_sam3_on_frame(prompt, first_path)
     label_map = masks_to_label_map(masks)
     ann0 = ann_dir / frames[0].replace(".jpg", ".png")
     Image.fromarray(label_map).save(ann0)
-
     log.info(f"SAM-3 kept {label_map.max()} masks")
     return int(label_map.max()), str(first_path)
 
@@ -2446,21 +2399,9 @@ def init_sam(run_id: str, prompt: str):
 
     log.info(f"/init_sam run_id={run_id} prompt={prompt} frames={len(frames)} fps={fps}")
 
-    # Run SAM-3 on frame 0 (EXACTLY like /init)
     log.info(f"[INIT_SAM] Running SAM-3 on frame 0, prompt={prompt}")
     first_path = jpeg_dir / frames[0]
-    try:
-        masks = run_sam3_on_frame(prompt, first_path)
-    except RuntimeError as e:
-        if _is_sam3_dtype_error(e):
-            log.error(f"[INIT_SAM] SAM-3 dtype error: {e}")
-            raise HTTPException(
-                500,
-                "SAM-3 failed due to a GPU dtype mismatch (BFloat16 vs Float). "
-                "Restart the server and try again; if it persists, ask the admin to pull the latest server.py.",
-            ) from e
-        raise
-
+    masks = run_sam3_on_frame(prompt, first_path)
     img = Image.open(first_path).convert("RGB")
     n_masks = len(masks)
     log.info(f"[INIT_SAM] SAM-3 kept {n_masks} masks")
@@ -4991,47 +4932,9 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
             "frame_index": 0,
             "text": prompt,
         }
-        log.info(f"[ADD_MASK] Text request: keys={list(text_request_dict.keys())}, has 'points': {'points' in text_request_dict}, has 'obj_id': {'obj_id' in text_request_dict}")
-        
-        # Retry logic for BFloat16 errors (SAM-3 internal issue)
-        max_retries = 2
-        for retry in range(max_retries):
-            try:
-                _ = predictor.handle_request(request=text_request_dict)
-                log.info(f"[ADD_MASK] Text prompt added successfully")
-                break
-            except Exception as e:
-                error_msg = str(e)
-                log.error(f"[ADD_MASK] Error adding text prompt (attempt {retry+1}/{max_retries}): {error_msg}")
-                log.error(f"[ADD_MASK] Error type: {type(e).__name__}")
-                
-                if "BFloat16" in error_msg or "bias type" in error_msg:
-                    log.error("[ADD_MASK] BFloat16 dtype error detected - this is a SAM-3 model state issue")
-                    if retry < max_retries - 1:
-                        log.warning("[ADD_MASK] Reinitializing predictor and retrying...")
-                        # Close current session before reinitializing
-                        try:
-                            predictor.handle_request(request=dict(type="close_session", session_id=session_id))
-                        except:
-                            pass
-                        # Reinitialize predictor
-                        predictor = get_video_predictor(force_reinit=True)
-                        # Restart session
-                        resp = predictor.handle_request(
-                            request=dict(
-                                type="start_session",
-                                resource_path=str(tmpdir),
-                            )
-                        )
-                        session_id = resp["session_id"]
-                        log.info(f"[ADD_MASK] Restarted session {session_id} after reinit")
-                        # Update text_request_dict with new session_id
-                        text_request_dict["session_id"] = session_id
-                        continue
-                    else:
-                        raise RuntimeError("SAM-3 model dtype error (BFloat16/bias mismatch) persisted after retries. Please try again later.") from e
-                raise
-        
+        predictor.handle_request(request=text_request_dict)
+        log.info("[ADD_MASK] Text prompt added")
+
         # Step 2: Propagate to get initial masks
         log.info(f"[ADD_MASK] Step 2: Propagating after text prompt to get initial masks...")
         outputs0_initial = None
@@ -5088,77 +4991,9 @@ def add_mask(run_id: str, frame_idx: int, add_request: AddMaskRequest):
             "obj_id": int(new_obj_id),
         }
         
-        log.info(f"[ADD_MASK] Calling predictor.handle_request with point prompts (obj_id={points_request.get('obj_id')})...")
-        
-        # Retry logic for BFloat16 errors (SAM-3 internal issue)
-        max_retries = 2
-        for retry in range(max_retries):
-            try:
-                _ = predictor.handle_request(request=points_request)
-                log.info(f"[ADD_MASK] ✓ Point prompts added successfully")
-                break
-            except Exception as e:
-                error_msg = str(e)
-                log.error(f"[ADD_MASK] Error adding point prompts (attempt {retry+1}/{max_retries}): {error_msg}")
-                log.error(f"[ADD_MASK] Error type: {type(e).__name__}")
-                
-                if "BFloat16" in error_msg or "bias type" in error_msg:
-                    log.error("[ADD_MASK] BFloat16 dtype error detected - this is a SAM-3 model state issue")
-                    if retry < max_retries - 1:
-                        log.warning("[ADD_MASK] Reinitializing predictor and retrying...")
-                        # Close current session before reinitializing
-                        try:
-                            predictor.handle_request(request=dict(type="close_session", session_id=session_id))
-                        except:
-                            pass
-                        # Reinitialize predictor
-                        predictor = get_video_predictor(force_reinit=True)
-                        # Restart session
-                        resp = predictor.handle_request(
-                            request=dict(
-                                type="start_session",
-                                resource_path=str(tmpdir),
-                            )
-                        )
-                        session_id = resp["session_id"]
-                        log.info(f"[ADD_MASK] Restarted session {session_id} after reinit")
-                        
-                        # Re-add text prompt
-                        text_request_dict = {
-                            "type": "add_prompt",
-                            "session_id": session_id,
-                            "frame_index": 0,
-                            "text": prompt,
-                        }
-                        _ = predictor.handle_request(request=text_request_dict)
-                        log.info(f"[ADD_MASK] Re-added text prompt after reinit")
-                        
-                        # Re-propagate to get initial masks
-                        outputs0_initial = None
-                        for resp in predictor.handle_stream_request(
-                            request=dict(type="propagate_in_video", session_id=session_id)
-                        ):
-                            if resp.get("frame_index") == 0:
-                                outputs0_initial = resp.get("outputs")
-                                break
-                        
-                        if outputs0_initial is None:
-                            raise RuntimeError("SAM3 propagate_in_video did not return frame 0 outputs after reinit")
-                        
-                        formatted0_initial = prepare_masks_for_visualization({0: outputs0_initial})[0]
-                        inst_list_initial = extract_instances_from_formatted(formatted0_initial)
-                        
-                        # Always use a new obj_id (don't check existing masks)
-                        max_obj_id = max([int(inst.get("obj_id", 0)) for inst in inst_list_initial], default=0)
-                        points_request["obj_id"] = max_obj_id + 1
-                        
-                        # Update session_id in points_request
-                        points_request["session_id"] = session_id
-                        continue
-                    else:
-                        raise RuntimeError("SAM-3 model dtype error (BFloat16/bias mismatch) persisted after retries. Please try again later.") from e
-                raise
-        
+        predictor.handle_request(request=points_request)
+        log.info("[ADD_MASK] Point prompts added")
+
         # Step 4: Propagate to get the new/refined mask
         log.info(f"[ADD_MASK] Step 4: Propagating after point prompts to get new mask...")
         outputs0 = None
@@ -5426,47 +5261,9 @@ def refine_mask(run_id: str, frame_idx: int, refine_request: RefineMaskRequest):
             "frame_index": 0,
             "text": prompt,
         }
-        log.info(f"[REFINE_MASK] Text request: keys={list(text_request_dict.keys())}, has 'points': {'points' in text_request_dict}, has 'obj_id': {'obj_id' in text_request_dict}")
-        
-        # Retry logic for BFloat16 errors (SAM-3 internal issue)
-        max_retries = 2
-        for retry in range(max_retries):
-            try:
-                _ = predictor.handle_request(request=text_request_dict)
-                log.info(f"[REFINE_MASK] Text prompt added successfully")
-                break
-            except Exception as e:
-                error_msg = str(e)
-                log.error(f"[REFINE_MASK] Error adding text prompt (attempt {retry+1}/{max_retries}): {error_msg}")
-                log.error(f"[REFINE_MASK] Error type: {type(e).__name__}")
-                
-                if "BFloat16" in error_msg or "bias type" in error_msg:
-                    log.error("[REFINE_MASK] BFloat16 dtype error detected - this is a SAM-3 model state issue")
-                    if retry < max_retries - 1:
-                        log.warning("[REFINE_MASK] Reinitializing predictor and retrying...")
-                        # Close current session before reinitializing
-                        try:
-                            predictor.handle_request(request=dict(type="close_session", session_id=session_id))
-                        except:
-                            pass
-                        # Reinitialize predictor
-                        predictor = get_video_predictor(force_reinit=True)
-                        # Restart session
-                        resp = predictor.handle_request(
-                            request=dict(
-                                type="start_session",
-                                resource_path=str(tmpdir),
-                            )
-                        )
-                        session_id = resp["session_id"]
-                        log.info(f"[REFINE_MASK] Restarted session {session_id} after reinit")
-                        # Update text_request_dict with new session_id
-                        text_request_dict["session_id"] = session_id
-                        continue
-                    else:
-                        raise RuntimeError("SAM-3 model dtype error (BFloat16/bias mismatch) persisted after retries. Please try again later.") from e
-                raise
-        
+        predictor.handle_request(request=text_request_dict)
+        log.info("[REFINE_MASK] Text prompt added")
+
         # NOW prepare points (after text prompt is done, to avoid any scope issues)
         points_xy = np.array([[p.x, p.y] for p in refine_request.points], dtype=np.float32)
         # SAM3 convention: positive=1, negative=0
