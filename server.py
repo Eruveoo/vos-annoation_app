@@ -143,6 +143,26 @@ except PermissionError:
     RUNS_ROOT.mkdir(parents=True, exist_ok=True)
     log.warning(f"Scratch path {_scratch_path} not writable, falling back to local runs directory: {RUNS_ROOT}")
 
+
+def scratch_subdir(name: str) -> Path:
+    """Writable scratch subdirectory for the current project (torch cache, tmp, etc.)."""
+    candidates: List[Path] = []
+    if _project_num:
+        candidates.append(Path(f"/scratch/project_{_project_num}") / name)
+    if str(RUNS_ROOT).startswith("/scratch"):
+        candidates.append(RUNS_ROOT.parent / name)
+    candidates.append(RUNS_ROOT / name)
+    last_err: Optional[OSError] = None
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError as e:
+            last_err = e
+            log.debug(f"scratch_subdir: cannot use {path}: {e}")
+    raise PermissionError(last_err or PermissionError(f"No writable scratch path for '{name}'"))
+
+
 # Progress tracking for upload/prepare operations
 # Key: run_id, Value: {"stage": "upload"|"extract", "progress": 0-100, "message": str}
 prepare_progress: Dict[str, Dict] = {}
@@ -1788,10 +1808,8 @@ def run_xmem(dataset_root: Path, xmem_output: Path):
     # Set TORCH_HOME and TMPDIR to use scratch space (avoid /tmp being full)
     # PyTorch will cache pretrained models (like ResNet50) here
     # TMPDIR is used for temporary extraction during download
-    torch_cache_dir = Path("/scratch/project_2016918/torch_cache")
-    torch_cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path("/scratch/project_2016918/tmp")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    torch_cache_dir = scratch_subdir("torch_cache")
+    tmp_dir = scratch_subdir("tmp")
     env = os.environ.copy()
     env["TORCH_HOME"] = str(torch_cache_dir)
     env["TMPDIR"] = str(tmp_dir)
@@ -6227,8 +6245,7 @@ def download_golden(run_id: str, background_tasks: BackgroundTasks):
     golden_root = run_dir / "golden"
     
     # Create a temporary zip file in scratch space
-    scratch_tmp = Path("/scratch/project_2016918/tmp")
-    scratch_tmp.mkdir(parents=True, exist_ok=True)
+    scratch_tmp = scratch_subdir("tmp")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=str(scratch_tmp)) as tmp_zip:
         zip_path = Path(tmp_zip.name)
     
