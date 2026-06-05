@@ -202,11 +202,13 @@ def update_meta_key(meta_path: Path, key: str, value: str) -> None:
 
 
 # -------------------------
-# Behaviour annotation: labels + segment storage
+# Behaviour annotation: labels + segment storage (3 dimensions)
 # -------------------------
+BEHAVIOR_LABEL_NONE = "none"
 NOT_VISIBLE_LABEL_ID = "not_visible"
+NOT_SEEN_LABEL_ID = "not_seen"
 
-BEHAVIOR_LABELS: List[Dict[str, Any]] = [
+BEHAVIOR_LABELS_ACTIVITY: List[Dict[str, Any]] = [
     {
         "id": "walk",
         "name_fi": "Kävelee",
@@ -272,69 +274,305 @@ BEHAVIOR_LABELS: List[Dict[str, Any]] = [
     },
 ]
 
-VALID_BEHAVIOR_LABEL_IDS = {label["id"] for label in BEHAVIOR_LABELS}
+# Label 2: syöminen, hoito, toimijan sosiaalinen/kiima-käyttäytyminen, ei näy
+BEHAVIOR_LABELS_LABEL2: List[Dict[str, Any]] = [
+    {
+        "id": BEHAVIOR_LABEL_NONE,
+        "name_fi": "Ei valittu",
+        "description_fi": "Ei käyttäytymistä tässä kategoriassa (oletus).",
+        "group_fi": "",
+    },
+    {
+        "id": "inactive_ruminate",
+        "name_fi": "Toimeton tai märehtii (ei labelia)",
+        "description_fi": "Eläin on toimeton tai märehtii; ei muuta Label 2 -käyttäytymistä.",
+        "group_fi": "",
+    },
+    {
+        "id": "feed_head_down",
+        "name_fi": "Ruokintapöydällä pää alhaalla",
+        "description_fi": (
+            "Eläin seisoo pää ruokintapöydän vieressä pää ruokintaesteen etupuolella, pää alhaalla "
+            "(syö, tutkii rehua ym.). Nopea rehun heittely sisältyy."
+        ),
+        "group_fi": "Syömiskäyttäytyminen",
+    },
+    {
+        "id": "feed_head_up",
+        "name_fi": "Ruokintapöydällä pää ylhäällä",
+        "description_fi": (
+            "Eläin seisoo pää ruokintapöydän vieressä pää ruokintaesteen etupuolella, pää ylhäällä "
+            "(pureskelee, on toimeton ym.)."
+        ),
+        "group_fi": "Syömiskäyttäytyminen",
+    },
+    {
+        "id": "drink",
+        "name_fi": "Juo",
+        "description_fi": (
+            "Juo, laskee päänsä kuppiin/altaaseen – nostaa sen pois kupista/altaasta. "
+            "Sisältää muutamien sekuntien tauot."
+        ),
+        "group_fi": "Syömiskäyttäytyminen",
+    },
+    {
+        "id": "groom_self",
+        "name_fi": "Kehon hoito itse",
+        "description_fi": "Nuolee, raapii tai hankaa itseään.",
+        "group_fi": "Kehon hoito",
+    },
+    {
+        "id": "scratch_neck_rail",
+        "name_fi": "Rapsuttelu karjaharjalla",
+        "description_fi": "Kehon rapsuttelu karjaharjaan.",
+        "group_fi": "Kehon hoito",
+    },
+    {
+        "id": "scratch_other",
+        "name_fi": "Rapsuttelu muuhun",
+        "description_fi": "Kehon rapsuttelu muuhun kuin karjaharjaan (parret ym.).",
+        "group_fi": "Kehon hoito",
+    },
+    {
+        "id": "social_lick_actor",
+        "name_fi": "Sosiaalinen nuoleminen (toimija)",
+        "description_fi": "Eläin nuolee toista eläintä yleensä päästä, kaulasta tai hartioista.",
+        "group_fi": "Sosiaalinen käyttäytyminen",
+    },
+    {
+        "id": "pushing",
+        "name_fi": "Puskeminen",
+        "description_fi": (
+            "Eläin sysää otsan tai pään ylöspäin suuntautuvalla liikkeellä vasten toisen eläimen "
+            "niskaa, hartioita, kylkeä tai takaosaa."
+        ),
+        "group_fi": "Sosiaalinen käyttäytyminen",
+    },
+    {
+        "id": "displacement_actor",
+        "name_fi": "Syrjäyttäminen (toimija)",
+        "description_fi": (
+            "Eläin puskee tai esim. vartalollaan tönimällä syrjäyttää toisen eläimen pois "
+            "ruokintapaikalta, juomakupilta tai makuupaikalta."
+        ),
+        "group_fi": "Sosiaalinen käyttäytyminen",
+    },
+    {
+        "id": "chin_rest_actor",
+        "name_fi": "Leuan lepuuttaminen (toimija)",
+        "description_fi": (
+            "Eläin testaa toisen lehmän seisomisrefleksiä ennen selkään hyppäämistä painamalla "
+            "leukaansa ja kurkkuaan lehmän takapuolen tai selän päälle."
+        ),
+        "group_fi": "Kiimakäyttäytyminen",
+    },
+    {
+        "id": "mount_actor",
+        "name_fi": "Selkään hyppääminen (toimija)",
+        "description_fi": (
+            "Eläin ponnistaa etujalkansa irti maasta ja nostaa ryntäänsä toisen lehmän selän päälle, "
+            "sijoittaen etujalkansa juuri lehmän lonkkakyhmyjen etupuolelle pitäen kiinni lehmästä."
+        ),
+        "group_fi": "Kiimakäyttäytyminen",
+    },
+    {
+        "id": "other_label2",
+        "name_fi": "Muu",
+        "description_fi": "Ei ole mitään yllä mainittua (ei toimeton tai märehdi).",
+        "group_fi": "Kiimakäyttäytyminen",
+    },
+    {
+        "id": NOT_SEEN_LABEL_ID,
+        "name_fi": "Ei näy",
+        "description_fi": "Käyttäytymistä ei näe.",
+        "group_fi": "",
+    },
+]
+
+# Label 3: vastaanottajan sosiaalinen ja kiima-käyttäytyminen
+BEHAVIOR_LABELS_LABEL3: List[Dict[str, Any]] = [
+    {
+        "id": BEHAVIOR_LABEL_NONE,
+        "name_fi": "Ei valittu",
+        "description_fi": "Ei käyttäytymistä tässä kategoriassa (oletus).",
+        "group_fi": "",
+    },
+    {
+        "id": "social_lick_receiver",
+        "name_fi": "Sosiaalinen nuoleminen (vastaanottaja)",
+        "description_fi": (
+            "Toinen eläin nuolee eläintä yleensä päästä, kaulasta tai hartioista. "
+            "Nuoltavana oleva eläin ojentaa usein kaulaansa ja päätään eteen."
+        ),
+        "group_fi": "Sosiaalinen käyttäytyminen",
+    },
+    {
+        "id": "displacement_receiver",
+        "name_fi": "Syrjäyttäminen (vastaanottaja)",
+        "description_fi": (
+            "Toinen eläin puskee tai esim. vartalollaan tönimällä syrjäyttää eläimen pois "
+            "ruokintapaikalta, juomakupilta tai makuupaikalta. Syrjäytettävä siirtyy noin lehmän mitan pois."
+        ),
+        "group_fi": "Sosiaalinen käyttäytyminen",
+    },
+    {
+        "id": "chin_rest_receiver",
+        "name_fi": "Leuan lepuuttaminen (vastaanottaja)",
+        "description_fi": "Toinen eläin lepuuttaa leukaa tämän lehmän selän tai takapuolen päällä.",
+        "group_fi": "Kiimakäyttäytyminen",
+    },
+    {
+        "id": "mount_receiver",
+        "name_fi": "Selkään hyppääminen (vastaanottaja)",
+        "description_fi": "Toinen eläin hyppää tämän lehmän selkään.",
+        "group_fi": "Kiimakäyttäytyminen",
+    },
+]
+
+BEHAVIOR_DIMENSIONS = ("activity", "label2", "label3")
+BEHAVIOR_DIMENSION_META: Dict[str, Dict[str, Any]] = {
+    "activity": {
+        "file": "behavior_labels_activity.json",
+        "labels": BEHAVIOR_LABELS_ACTIVITY,
+        "default_label": "stand",
+        "title_fi": "Label 1: Aktivisuus",
+        "required": True,
+        "affects_preview": True,
+        "hidden_ids": set(),
+    },
+    "label2": {
+        "file": "behavior_labels_label2.json",
+        "labels": BEHAVIOR_LABELS_LABEL2,
+        "default_label": BEHAVIOR_LABEL_NONE,
+        "title_fi": "Label 2: Toimija / syöminen / hoito",
+        "required": False,
+        "affects_preview": True,
+        "hidden_ids": set(),
+    },
+    "label3": {
+        "file": "behavior_labels_label3.json",
+        "labels": BEHAVIOR_LABELS_LABEL3,
+        "default_label": BEHAVIOR_LABEL_NONE,
+        "title_fi": "Label 3: Vastaanottaja",
+        "required": False,
+        "affects_preview": True,
+        "hidden_ids": set(),
+    },
+}
+
 DEFAULT_BEHAVIOR_LABEL_ID = "stand"
-BEHAVIOR_FILE_NAME = "behavior_labels.json"
+BEHAVIOR_FILE_NAME = "behavior_labels_activity.json"
 
 
-def behavior_label_by_id(label_id: str) -> Dict[str, Any]:
-    for label in BEHAVIOR_LABELS:
+def _valid_label_ids_for_dimension(dimension: str) -> set:
+    return {label["id"] for label in BEHAVIOR_DIMENSION_META[dimension]["labels"]}
+
+
+def _default_label_for_dimension(dimension: str) -> str:
+    return BEHAVIOR_DIMENSION_META[dimension]["default_label"]
+
+
+def _segment_visible(label_id: str, dimension: str) -> bool:
+    if dimension == "activity":
+        return label_id != NOT_VISIBLE_LABEL_ID
+    if dimension == "label2":
+        return label_id not in (BEHAVIOR_LABEL_NONE, NOT_SEEN_LABEL_ID)
+    # label3: only receiver behaviours count as active segments
+    return label_id != BEHAVIOR_LABEL_NONE
+
+
+def behavior_label_by_id(label_id: str, dimension: str = "activity") -> Dict[str, Any]:
+    for label in BEHAVIOR_DIMENSION_META[dimension]["labels"]:
         if label["id"] == label_id:
             return label
     raise KeyError(label_id)
 
 
-def behavior_file_path(run_dir: Path) -> Path:
-    return run_dir / BEHAVIOR_FILE_NAME
+def behavior_file_path(run_dir: Path, dimension: str = "activity") -> Path:
+    return run_dir / BEHAVIOR_DIMENSION_META[dimension]["file"]
 
 
-def empty_behavior_data(cow_ids: Optional[List[int]] = None) -> Dict[str, Any]:
-    return {
+def empty_behavior_data(cow_ids: Optional[List[int]] = None, dimension: str = "activity") -> Dict[str, Any]:
+    data: Dict[str, Any] = {
         "version": 1,
+        "dimension": dimension,
         "segments": [],
         "cow_ids": sorted(cow_ids or []),
     }
+    if dimension == "activity":
+        data["preview_in_sync"] = True
+    return data
 
 
-def load_behavior_data(run_dir: Path) -> Optional[Dict[str, Any]]:
-    path = behavior_file_path(run_dir)
+def load_behavior_dimension(run_dir: Path, dimension: str) -> Optional[Dict[str, Any]]:
+    path = behavior_file_path(run_dir, dimension)
     if not path.exists():
         return None
     with path.open(encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_behavior_data(run_dir: Path, data: Dict[str, Any]) -> None:
-    path = behavior_file_path(run_dir)
+def save_behavior_dimension(run_dir: Path, dimension: str, data: Dict[str, Any]) -> None:
+    path = behavior_file_path(run_dir, dimension)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _validate_behavior_label_id(label_id: str) -> None:
-    if label_id not in VALID_BEHAVIOR_LABEL_IDS:
-        raise ValueError(f"Unknown label_id: {label_id}")
+def load_behavior_data(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """Activity dimension (Label 1); used for golden preview overlay."""
+    return load_behavior_dimension(run_dir, "activity")
+
+
+def save_behavior_data(run_dir: Path, data: Dict[str, Any]) -> None:
+    save_behavior_dimension(run_dir, "activity", data)
+
+
+def mark_behavior_preview_out_of_sync(run_dir: Path) -> None:
+    data = load_behavior_dimension(run_dir, "activity")
+    if data is None:
+        return
+    data["preview_in_sync"] = False
+    save_behavior_dimension(run_dir, "activity", data)
+
+
+def mark_behavior_preview_in_sync(run_dir: Path) -> None:
+    data = load_behavior_dimension(run_dir, "activity")
+    if data is None:
+        return
+    data["preview_in_sync"] = True
+    save_behavior_dimension(run_dir, "activity", data)
+
+
+def _validate_behavior_label_id(label_id: str, dimension: str) -> None:
+    if label_id not in _valid_label_ids_for_dimension(dimension):
+        raise ValueError(f"Unknown label_id for {dimension}: {label_id}")
+    meta = BEHAVIOR_DIMENSION_META[dimension]
+    if meta["required"] and label_id == BEHAVIOR_LABEL_NONE:
+        raise ValueError(f"Label 1 (activity) cannot be '{BEHAVIOR_LABEL_NONE}'")
 
 
 def create_initial_segments(
     cow_ids: List[int],
     start_frame: int,
     labels_by_cow: Dict[int, str],
+    dimension: str = "activity",
 ) -> Dict[str, Any]:
     """One open-ended segment per cow starting at start_frame."""
     segments: List[Dict[str, Any]] = []
+    default_label = _default_label_for_dimension(dimension)
     for cow_id in sorted(cow_ids):
-        label_id = labels_by_cow.get(cow_id, DEFAULT_BEHAVIOR_LABEL_ID)
-        _validate_behavior_label_id(label_id)
+        label_id = labels_by_cow.get(cow_id, default_label)
+        _validate_behavior_label_id(label_id, dimension)
         segments.append(
             {
                 "cow_id": int(cow_id),
                 "start_frame": int(start_frame),
                 "end_frame": None,
                 "label_id": label_id,
-                "visible": label_id != NOT_VISIBLE_LABEL_ID,
+                "visible": _segment_visible(label_id, dimension),
             }
         )
-    return empty_behavior_data(cow_ids) | {"segments": segments}
+    return empty_behavior_data(cow_ids, dimension) | {"segments": segments}
 
 
 def _close_open_behavior_segment(segments: List[Dict[str, Any]], cow_id: int, end_frame: int) -> None:
@@ -349,11 +587,12 @@ def set_label_from_frame(
     cow_id: int,
     frame: int,
     label_id: str,
+    dimension: str = "activity",
 ) -> Dict[str, Any]:
     """
     Close the current open segment for cow_id (if any) at frame-1, then start a new segment at frame.
     """
-    _validate_behavior_label_id(label_id)
+    _validate_behavior_label_id(label_id, dimension)
     frame = int(frame)
     cow_id = int(cow_id)
     segments: List[Dict[str, Any]] = list(data.get("segments", []))
@@ -361,7 +600,7 @@ def set_label_from_frame(
     for seg in segments:
         if seg["cow_id"] == cow_id and seg.get("end_frame") is None and seg["start_frame"] == frame:
             seg["label_id"] = label_id
-            seg["visible"] = label_id != NOT_VISIBLE_LABEL_ID
+            seg["visible"] = _segment_visible(label_id, dimension)
             data["segments"] = segments
             if cow_id not in data.get("cow_ids", []):
                 data.setdefault("cow_ids", []).append(cow_id)
@@ -377,7 +616,7 @@ def set_label_from_frame(
             "start_frame": frame,
             "end_frame": None,
             "label_id": label_id,
-            "visible": label_id != NOT_VISIBLE_LABEL_ID,
+            "visible": _segment_visible(label_id, dimension),
         }
     )
     data["segments"] = segments
@@ -414,19 +653,29 @@ def labels_at_frame(data: Dict[str, Any], frame: int) -> Dict[int, str]:
     return out
 
 
-def behavior_name_fi_at_frame(run_dir: Path, cow_id: int, frame_idx: int) -> Optional[str]:
+def behavior_overlay_lines_at_frame(run_dir: Path, cow_id: int, frame_idx: int) -> List[str]:
+    """Finnish label lines for golden preview: activity, then label2, then label3."""
     if get_annotation_mode(run_dir) != "behavior":
-        return None
-    data = load_behavior_data(run_dir)
-    if not data:
-        return None
-    label_id = get_behavior_label_at_frame(data, cow_id, frame_idx)
-    if not label_id:
-        return None
-    try:
-        return behavior_label_by_id(label_id)["name_fi"]
-    except KeyError:
-        return label_id
+        return []
+    lines: List[str] = []
+    for dim in BEHAVIOR_DIMENSIONS:
+        data = load_behavior_dimension(run_dir, dim)
+        if not data:
+            continue
+        label_id = get_behavior_label_at_frame(data, cow_id, frame_idx)
+        if not label_id:
+            continue
+        if dim == "activity" and label_id == NOT_VISIBLE_LABEL_ID:
+            continue
+        if dim == "label2" and label_id in (BEHAVIOR_LABEL_NONE, NOT_SEEN_LABEL_ID):
+            continue
+        if dim == "label3" and label_id == BEHAVIOR_LABEL_NONE:
+            continue
+        try:
+            lines.append(behavior_label_by_id(label_id, dim)["name_fi"])
+        except KeyError:
+            lines.append(label_id)
+    return lines
 
 
 _UNICODE_FONT_PATHS = [
@@ -453,7 +702,9 @@ def _draw_unicode_text_on_bgr(
     center_x: int,
     top_y: int,
     font_px: int = 15,
-    fill_rgb: Tuple[int, int, int] = (255, 255, 255),
+    fill_rgb: Tuple[int, int, int] = (0, 0, 0),
+    outline_rgb: Optional[Tuple[int, int, int]] = (255, 255, 255),
+    outline_width: int = 1,
 ) -> np.ndarray:
     if not text:
         return frame_bgr
@@ -464,6 +715,12 @@ def _draw_unicode_text_on_bgr(
     text_w = bbox[2] - bbox[0]
     x = int(center_x - text_w / 2)
     y = int(top_y)
+    if outline_rgb and outline_width > 0:
+        for ox in range(-outline_width, outline_width + 1):
+            for oy in range(-outline_width, outline_width + 1):
+                if ox == 0 and oy == 0:
+                    continue
+                draw.text((x + ox, y + oy), text, font=font, fill=outline_rgb)
     draw.text((x, y), text, font=font, fill=fill_rgb)
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
@@ -473,11 +730,11 @@ def draw_cow_overlay_with_behavior(
     mask: np.ndarray,
     cow_id: int,
     color: Tuple[int, int, int],
-    behavior_name_fi: Optional[str] = None,
+    behavior_lines: Optional[List[str]] = None,
     overlay_alpha: float = 0.4,
     id_font_scale: float = 0.8,
 ) -> np.ndarray:
-    """Draw mask tint, cow ID, and optional behaviour label below the ID."""
+    """Draw mask tint, cow ID, and behaviour labels (stacked) below the ID."""
     if not mask.any():
         return frame
 
@@ -493,11 +750,25 @@ def draw_cow_overlay_with_behavior(
     (id_w, id_h), baseline = cv2.getTextSize(
         id_text, cv2.FONT_HERSHEY_SIMPLEX, id_font_scale, thickness
     )
-    line_gap = 4
-    stack_h = id_h + (18 if behavior_name_fi else 0)
+    label_font_px = 14
+    label_line_gap = 3
+    lines = [ln for ln in (behavior_lines or []) if ln]
+    labels_block_h = len(lines) * (label_font_px + label_line_gap) if lines else 0
+    stack_gap = 4
+    stack_h = id_h + (stack_gap + labels_block_h if lines else 0)
     id_y = cy + id_h // 2 - stack_h // 2 + id_h
     id_x = cx - id_w // 2
 
+    cv2.putText(
+        frame,
+        id_text,
+        (id_x, id_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        id_font_scale,
+        (0, 0, 0),
+        thickness + 1,
+        cv2.LINE_AA,
+    )
     cv2.putText(
         frame,
         id_text,
@@ -509,9 +780,19 @@ def draw_cow_overlay_with_behavior(
         cv2.LINE_AA,
     )
 
-    if behavior_name_fi:
-        behavior_top = id_y + line_gap
-        frame = _draw_unicode_text_on_bgr(frame, behavior_name_fi, cx, behavior_top, font_px=15)
+    y = id_y + stack_gap
+    for line in lines:
+        frame = _draw_unicode_text_on_bgr(
+            frame,
+            line,
+            cx,
+            y,
+            font_px=label_font_px,
+            fill_rgb=(0, 0, 0),
+            outline_rgb=(255, 255, 255),
+            outline_width=1,
+        )
+        y += label_font_px + label_line_gap
 
     return frame
 
@@ -776,6 +1057,9 @@ def get_model():
         t0 = time.perf_counter()
         _ensure_sam3_assets()
         MODEL = build_sam3_image_model()
+        # Ensure model is in float32 to avoid dtype mismatch errors
+        # (some systems/GPUs may load models in BFloat16 by default)
+        MODEL = MODEL.float()
         PROCESSOR = Sam3Processor(MODEL)
         log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s")
     return PROCESSOR
@@ -793,6 +1077,8 @@ def get_video_predictor(force_reinit=False):
         _ensure_sam3_assets()
         gpu_ids = [torch.cuda.current_device()] if torch.cuda.is_available() else []
         VIDEO_PREDICTOR = build_sam3_video_predictor(gpus_to_use=gpu_ids)
+        # Ensure model is in float32 to avoid dtype mismatch errors
+        VIDEO_PREDICTOR = VIDEO_PREDICTOR.float()
         log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s")
     return VIDEO_PREDICTOR
 
@@ -1547,11 +1833,13 @@ def render_video(
                 m = (mask == cid)
                 if not m.any():
                     continue
-                behavior_name = None
+                behavior_lines = None
                 if draw_behavior:
-                    behavior_name = behavior_name_fi_at_frame(run_dir, cid, abs_frame_idx)
+                    behavior_lines = behavior_overlay_lines_at_frame(
+                        run_dir, cid, abs_frame_idx
+                    )
                 frame = draw_cow_overlay_with_behavior(
-                    frame, m, cid, col, behavior_name_fi=behavior_name
+                    frame, m, cid, col, behavior_lines=behavior_lines
                 )
 
             # Write processed frame to temp directory (use quality 85 for faster I/O)
@@ -2145,6 +2433,8 @@ class IDMapping(BaseModel):
 class ApplyInitPayload(BaseModel):
     mapping: Dict[str, int]
     behavior_by_cow_id: Optional[Dict[str, str]] = None
+    behavior_label2_by_cow_id: Optional[Dict[str, str]] = None
+    behavior_label3_by_cow_id: Optional[Dict[str, str]] = None
 
 
 class AnnotationModePayload(BaseModel):
@@ -2155,6 +2445,7 @@ class BehaviorSetLabelPayload(BaseModel):
     cow_id: int
     frame: int
     label_id: str
+    dimension: str = "activity"
 
 
 class PreviewUpdate(BaseModel):
@@ -2351,7 +2642,45 @@ def preview_init_update(run_id: str, preview_update: PreviewUpdate):
 
 @app.get("/behavior/labels")
 def list_behavior_labels():
-    return {"labels": BEHAVIOR_LABELS}
+    return {
+        "labels": BEHAVIOR_LABELS_ACTIVITY,
+        "labels_activity": BEHAVIOR_LABELS_ACTIVITY,
+        "labels_label2": BEHAVIOR_LABELS_LABEL2,
+        "labels_label3": BEHAVIOR_LABELS_LABEL3,
+        "dimensions": {
+            dim: {
+                "title_fi": BEHAVIOR_DIMENSION_META[dim]["title_fi"],
+                "required": BEHAVIOR_DIMENSION_META[dim]["required"],
+                "default_label": BEHAVIOR_DIMENSION_META[dim]["default_label"],
+            }
+            for dim in BEHAVIOR_DIMENSIONS
+        },
+    }
+
+
+def _behavior_dimension_api_payload(data: Optional[Dict[str, Any]], dimension: str, frame: Optional[int]) -> Dict[str, Any]:
+    meta = BEHAVIOR_DIMENSION_META[dimension]
+    payload: Dict[str, Any] = {
+        "segments": [],
+        "cow_ids": [],
+        "labels_at_frame": {},
+        "labels": meta["labels"],
+        "title_fi": meta["title_fi"],
+        "required": meta["required"],
+        "default_label": meta["default_label"],
+    }
+    if dimension == "activity":
+        payload["preview_in_sync"] = True
+    if data:
+        payload["segments"] = data.get("segments", [])
+        payload["cow_ids"] = data.get("cow_ids", [])
+        if dimension == "activity":
+            payload["preview_in_sync"] = bool(data.get("preview_in_sync", True))
+        if frame is not None:
+            payload["labels_at_frame"] = {
+                str(k): v for k, v in labels_at_frame(data, int(frame)).items()
+            }
+    return payload
 
 
 @app.post("/run/{run_id}/annotation_mode")
@@ -2373,23 +2702,21 @@ def get_behavior(run_id: str, frame: Optional[int] = Query(None)):
     run_dir = RUNS_ROOT / run_id
     if not (run_dir / "meta.txt").exists():
         raise HTTPException(404, "run_id not found")
-    data = load_behavior_data(run_dir)
     mode = get_annotation_mode(run_dir)
-    result = {
+    activity_data = load_behavior_dimension(run_dir, "activity")
+    result: Dict[str, Any] = {
         "run_id": run_id,
         "annotation_mode": mode,
-        "labels": BEHAVIOR_LABELS,
-        "segments": [],
-        "cow_ids": [],
-        "labels_at_frame": {},
+        "labels": BEHAVIOR_LABELS_ACTIVITY,
+        "labels_activity": BEHAVIOR_LABELS_ACTIVITY,
+        "labels_label2": BEHAVIOR_LABELS_LABEL2,
+        "labels_label3": BEHAVIOR_LABELS_LABEL3,
+        "preview_in_sync": bool(activity_data.get("preview_in_sync", True)) if activity_data else True,
+        "dimensions": {},
     }
-    if data:
-        result["segments"] = data.get("segments", [])
-        result["cow_ids"] = data.get("cow_ids", [])
-        if frame is not None:
-            result["labels_at_frame"] = {
-                str(k): v for k, v in labels_at_frame(data, int(frame)).items()
-            }
+    for dim in BEHAVIOR_DIMENSIONS:
+        dim_data = load_behavior_dimension(run_dir, dim)
+        result["dimensions"][dim] = _behavior_dimension_api_payload(dim_data, dim, frame)
     return result
 
 
@@ -2400,30 +2727,40 @@ def behavior_set_label(run_id: str, payload: BehaviorSetLabelPayload):
         raise HTTPException(404, "run_id not found")
     if get_annotation_mode(run_dir) != "behavior":
         raise HTTPException(400, "Run is not in behavior annotation mode")
-    data = load_behavior_data(run_dir)
+    dimension = (payload.dimension or "activity").strip().lower()
+    if dimension not in BEHAVIOR_DIMENSIONS:
+        raise HTTPException(400, f"dimension must be one of {BEHAVIOR_DIMENSIONS}")
+    data = load_behavior_dimension(run_dir, dimension)
     if not data:
         raise HTTPException(400, "No behavior data for this run; complete ID assignment first")
     if payload.frame < 0:
         raise HTTPException(400, "frame must be >= 0")
     try:
-        set_label_from_frame(data, payload.cow_id, payload.frame, payload.label_id)
+        set_label_from_frame(data, payload.cow_id, payload.frame, payload.label_id, dimension)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    save_behavior_data(run_dir, data)
+    save_behavior_dimension(run_dir, dimension, data)
+    preview_in_sync = None
+    if BEHAVIOR_DIMENSION_META[dimension]["affects_preview"]:
+        mark_behavior_preview_out_of_sync(run_dir)
+        activity_data = load_behavior_dimension(run_dir, "activity")
+        preview_in_sync = bool(activity_data.get("preview_in_sync", False)) if activity_data else False
     log.info(
-        f"[BEHAVIOR] set_label run_id={run_id} cow_id={payload.cow_id} "
+        f"[BEHAVIOR] set_label run_id={run_id} dim={dimension} cow_id={payload.cow_id} "
         f"frame={payload.frame} label={payload.label_id}"
     )
-    preview_rebuilt = rebuild_golden_preview_video(run_dir)
+    labels_at = {
+        str(k): v for k, v in labels_at_frame(data, payload.frame).items()
+    }
     return {
         "run_id": run_id,
+        "dimension": dimension,
         "cow_id": payload.cow_id,
         "frame": payload.frame,
         "label_id": payload.label_id,
-        "preview_rebuilt": preview_rebuilt,
-        "label_at_frame": {
-            str(k): v for k, v in labels_at_frame(data, payload.frame).items()
-        },
+        "preview_in_sync": preview_in_sync,
+        "label_at_frame": labels_at,
+        "labels_at_frame": labels_at,
     }
 
 
@@ -2438,7 +2775,8 @@ def golden_rebuild_preview(run_id: str):
     ok = rebuild_golden_preview_video(run_dir)
     if not ok:
         raise HTTPException(500, "Failed to rebuild golden preview")
-    return {"run_id": run_id, "preview_rebuilt": True}
+    mark_behavior_preview_in_sync(run_dir)
+    return {"run_id": run_id, "preview_rebuilt": True, "preview_in_sync": True}
 
 
 @app.post("/apply_init_ids/{run_id}")
@@ -2497,19 +2835,34 @@ def apply_init_ids(run_id: str, payload: ApplyInitPayload):
     meta_content = meta_path.read_text()
     meta_path.write_text(meta_content.replace("ids=0", f"ids={n_ids}"))
 
-    # Behaviour labels: initial segments at frame 0 (before preview so labels appear on video)
+    # Behaviour labels: initial segments at frame 0 (3 JSON files; activity before preview)
     if get_annotation_mode(run_dir) == "behavior":
         cow_ids = sorted({int(v) for v in payload.mapping.values() if int(v) > 0})
-        labels_by_cow: Dict[int, str] = {}
-        if payload.behavior_by_cow_id:
-            for cow_key, label_id in payload.behavior_by_cow_id.items():
-                labels_by_cow[int(cow_key)] = label_id
-        for cow_id in cow_ids:
-            if cow_id not in labels_by_cow:
-                labels_by_cow[cow_id] = DEFAULT_BEHAVIOR_LABEL_ID
-        behavior_data = create_initial_segments(cow_ids, 0, labels_by_cow)
-        save_behavior_data(run_dir, behavior_data)
-        log.info(f"[APPLY_INIT_IDS] Saved behavior segments for cows={cow_ids}")
+
+        def _labels_from_payload(
+            optional_map: Optional[Dict[str, str]],
+            dimension: str,
+        ) -> Dict[int, str]:
+            out: Dict[int, str] = {}
+            default = _default_label_for_dimension(dimension)
+            if optional_map:
+                for cow_key, label_id in optional_map.items():
+                    out[int(cow_key)] = label_id
+            for cow_id in cow_ids:
+                if cow_id not in out:
+                    out[cow_id] = default
+            return out
+
+        for dim in BEHAVIOR_DIMENSIONS:
+            if dim == "activity":
+                init_map = _labels_from_payload(payload.behavior_by_cow_id, dim)
+            elif dim == "label2":
+                init_map = _labels_from_payload(payload.behavior_label2_by_cow_id, dim)
+            else:
+                init_map = _labels_from_payload(payload.behavior_label3_by_cow_id, dim)
+            dim_data = create_initial_segments(cow_ids, 0, init_map, dim)
+            save_behavior_dimension(run_dir, dim, dim_data)
+        log.info(f"[APPLY_INIT_IDS] Saved behavior segments (3 dims) for cows={cow_ids}")
 
     # Initialize golden preview video with frame0
     seg0 = run_dir / "golden_segments" / "00000_00000.mp4"
@@ -3486,6 +3839,10 @@ def commit(run_id: str):
 
 
     processed, pct, max_idx = golden_progress(run_dir, n_total)
+
+    if get_annotation_mode(run_dir) == "behavior" and load_behavior_data(run_dir) is not None:
+        mark_behavior_preview_out_of_sync(run_dir)
+
     return {
         "run_id": run_id,
         "committed_new_frames": committed,
@@ -3494,6 +3851,7 @@ def commit(run_id: str):
         "golden_max_idx": max_idx,
         "seed_idx": seed_idx,
         "end_idx": end_idx,
+        "preview_in_sync": False if get_annotation_mode(run_dir) == "behavior" else None,
     }
 
 
@@ -5989,15 +6347,16 @@ def download_golden(run_id: str, background_tasks: BackgroundTasks):
     
     # Create zip file with golden folder contents
     log.info(f"[DOWNLOAD_GOLDEN] Creating zip file: {zip_path}")
-    behavior_path = run_dir / "behavior_labels.json"
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for file_path in golden_root.rglob('*'):
             if file_path.is_file():
                 arcname = file_path.relative_to(golden_root)
                 zipf.write(file_path, arcname)
-        if behavior_path.is_file():
-            zipf.write(behavior_path, "behavior_labels.json")
-            log.info(f"[DOWNLOAD_GOLDEN] Included {behavior_path.name} in zip")
+        for dim in BEHAVIOR_DIMENSIONS:
+            bpath = behavior_file_path(run_dir, dim)
+            if bpath.is_file():
+                zipf.write(bpath, bpath.name)
+                log.info(f"[DOWNLOAD_GOLDEN] Included {bpath.name} in zip")
     
     log.info(f"[DOWNLOAD_GOLDEN] Zip file created: {zip_path} ({zip_path.stat().st_size} bytes)")
     

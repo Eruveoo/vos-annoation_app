@@ -2,7 +2,12 @@ import React, { useState, useEffect } from "react";
 import Frame0Preview from "../Frame0Preview.jsx";
 import IDAssignmentTable from "../IDAssignmentTable.jsx";
 import { matchInitIds, previewInitUpdate } from "../api.js";
-import { ANNOTATION_MODES, DEFAULT_BEHAVIOR_LABEL_ID } from "../behaviorLabels.js";
+import {
+  ANNOTATION_MODES,
+  DEFAULT_BEHAVIOR_LABEL_ID,
+  DEFAULT_LABEL2_LABEL_ID,
+  DEFAULT_LABEL3_LABEL_ID,
+} from "../behaviorLabels.js";
 
 export default function IDAssignmentPage({
   runId,
@@ -13,6 +18,8 @@ export default function IDAssignmentPage({
 }) {
   const [idMapping, setIdMapping] = useState({});
   const [behaviorMapping, setBehaviorMapping] = useState({});
+  const [behaviorLabel2Mapping, setBehaviorLabel2Mapping] = useState({});
+  const [behaviorLabel3Mapping, setBehaviorLabel3Mapping] = useState({});
   const isBehaviorMode = annotationMode === ANNOTATION_MODES.BEHAVIOR;
   const [currentFrame0Image, setCurrentFrame0Image] = useState(frame0Image);
   const [previousMaskFile, setPreviousMaskFile] = useState(null);
@@ -29,11 +36,17 @@ export default function IDAssignmentPage({
         initialMapping[assignment.mask_index] = assignment.auto_assigned_id;
       });
       setIdMapping(initialMapping);
-      const initialBehavior = {};
+      const initialActivity = {};
+      const initialLabel2 = {};
+      const initialLabel3 = {};
       maskAssignments.forEach((assignment) => {
-        initialBehavior[assignment.mask_index] = DEFAULT_BEHAVIOR_LABEL_ID;
+        initialActivity[assignment.mask_index] = DEFAULT_BEHAVIOR_LABEL_ID;
+        initialLabel2[assignment.mask_index] = DEFAULT_LABEL2_LABEL_ID;
+        initialLabel3[assignment.mask_index] = DEFAULT_LABEL3_LABEL_ID;
       });
-      setBehaviorMapping(initialBehavior);
+      setBehaviorMapping(initialActivity);
+      setBehaviorLabel2Mapping(initialLabel2);
+      setBehaviorLabel3Mapping(initialLabel3);
     }
   }, [maskAssignments]);
 
@@ -117,12 +130,13 @@ export default function IDAssignmentPage({
         >
           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
             <h2 style={{ margin: 0 }}>
-              {isBehaviorMode ? "Assign IDs & behaviour (frame 0)" : "Assign IDs"}
+              {isBehaviorMode ? "Assign IDs & behaviours (frame 0)" : "Assign IDs"}
             </h2>
           </div>
           {isBehaviorMode && (
             <p style={{ margin: 0, fontSize: 14, color: "#6c757d", lineHeight: 1.5 }}>
-              Choose the initial behaviour label for each cow. You can update labels later in the Golden tab.
+              Label 1 (Aktivisuus) is required. Labels 2 and 3 default to &quot;Ei valittu&quot;. You can
+              update all labels later on the Golden tab.
             </p>
           )}
 
@@ -281,6 +295,10 @@ export default function IDAssignmentPage({
               showBehavior={isBehaviorMode}
               behaviorMapping={behaviorMapping}
               onBehaviorMappingChange={setBehaviorMapping}
+              behaviorLabel2Mapping={behaviorLabel2Mapping}
+              onBehaviorLabel2MappingChange={setBehaviorLabel2Mapping}
+              behaviorLabel3Mapping={behaviorLabel3Mapping}
+              onBehaviorLabel3MappingChange={setBehaviorLabel3Mapping}
             />
           </div>
         </div>
@@ -289,16 +307,24 @@ export default function IDAssignmentPage({
         <button
           onClick={() => {
             let behaviorByCowId = null;
+            let behaviorLabel2ByCowId = null;
+            let behaviorLabel3ByCowId = null;
             if (isBehaviorMode) {
               behaviorByCowId = {};
+              behaviorLabel2ByCowId = {};
+              behaviorLabel3ByCowId = {};
               Object.entries(idMapping).forEach(([maskIdx, cowId]) => {
                 if (cowId !== undefined && cowId >= 1) {
-                  const labelId = behaviorMapping[maskIdx] || DEFAULT_BEHAVIOR_LABEL_ID;
-                  behaviorByCowId[String(cowId)] = labelId;
+                  behaviorByCowId[String(cowId)] =
+                    behaviorMapping[maskIdx] || DEFAULT_BEHAVIOR_LABEL_ID;
+                  behaviorLabel2ByCowId[String(cowId)] =
+                    behaviorLabel2Mapping[maskIdx] || DEFAULT_LABEL2_LABEL_ID;
+                  behaviorLabel3ByCowId[String(cowId)] =
+                    behaviorLabel3Mapping[maskIdx] || DEFAULT_LABEL3_LABEL_ID;
                 }
               });
             }
-            onIdsApplied(idMapping, behaviorByCowId);
+            onIdsApplied(idMapping, behaviorByCowId, behaviorLabel2ByCowId, behaviorLabel3ByCowId);
           }}
           disabled={busy}
           style={{

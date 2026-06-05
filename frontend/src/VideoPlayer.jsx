@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from "react";
 
 /**
  * Video player component
@@ -8,18 +8,33 @@ import React, { useState, useRef, useEffect } from "react";
  * @param {number} progress - Optional progress percentage (0-100)
  * @param {string} progressMessage - Optional progress message
  */
-export default function VideoPlayer({
-  videoUrl,
-  label,
-  height = 480,
-  progress = null,
-  progressMessage = null,
-  fps = null,
-  onPlaybackFrame = null,
-}) {
+const VideoPlayer = forwardRef(function VideoPlayer(
+  {
+    videoUrl,
+    label,
+    height = 480,
+    progress = null,
+    progressMessage = null,
+    fps = null,
+    onPlaybackFrame = null,
+  },
+  ref
+) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const videoRef = useRef(null);
+
+  useImperativeHandle(ref, () => ({
+    seekToFrame(frame) {
+      const video = videoRef.current;
+      if (!video || !fps) return;
+      const t = Math.max(0, Number(frame) / fps);
+      video.currentTime = t;
+      if (onPlaybackFrame) {
+        onPlaybackFrame(Math.max(0, Math.floor(t * fps)));
+      }
+    },
+  }));
 
   useEffect(() => {
     if (videoUrl && videoRef.current) {
@@ -268,4 +283,6 @@ export default function VideoPlayer({
       </div>
     </div>
   );
-}
+});
+
+export default VideoPlayer;

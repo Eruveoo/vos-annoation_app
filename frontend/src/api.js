@@ -339,10 +339,22 @@ export function getSourceVideoUrl(runId) {
  * @param {Object} mapping - Object mapping mask_index (string) to final_id (number)
  * @returns {Promise<{run_id: string, n_ids: number}>}
  */
-export async function applyInitIds(runId, mapping, behaviorByCowId = null) {
+export async function applyInitIds(
+  runId,
+  mapping,
+  behaviorByCowId = null,
+  behaviorLabel2ByCowId = null,
+  behaviorLabel3ByCowId = null
+) {
   const body = { mapping };
   if (behaviorByCowId && Object.keys(behaviorByCowId).length > 0) {
     body.behavior_by_cow_id = behaviorByCowId;
+  }
+  if (behaviorLabel2ByCowId && Object.keys(behaviorLabel2ByCowId).length > 0) {
+    body.behavior_label2_by_cow_id = behaviorLabel2ByCowId;
+  }
+  if (behaviorLabel3ByCowId && Object.keys(behaviorLabel3ByCowId).length > 0) {
+    body.behavior_label3_by_cow_id = behaviorLabel3ByCowId;
   }
   const res = await fetch(`${BACKEND}/apply_init_ids/${runId}`, {
     method: "POST",
@@ -379,11 +391,11 @@ export async function getBehavior(runId, frame = null) {
   return res.json();
 }
 
-export async function setBehaviorLabel(runId, cowId, frame, labelId) {
+export async function setBehaviorLabel(runId, cowId, frame, labelId, dimension = "activity") {
   const res = await fetch(`${BACKEND}/behavior/${runId}/set_label`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cow_id: cowId, frame, label_id: labelId }),
+    body: JSON.stringify({ cow_id: cowId, frame, label_id: labelId, dimension }),
   });
   if (!res.ok) {
     const error = await res.text();

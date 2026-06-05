@@ -89,7 +89,12 @@ export default function App() {
   };
 
   // Handle IDs applied - go to main workspace
-  const handleIdsApplied = async (mapping, behaviorByCowId = null) => {
+  const handleIdsApplied = async (
+    mapping,
+    behaviorByCowId = null,
+    behaviorLabel2ByCowId = null,
+    behaviorLabel3ByCowId = null
+  ) => {
     if (!runId) {
       return;
     }
@@ -108,7 +113,13 @@ export default function App() {
     }
 
     try {
-      await applyInitIds(runId, validMapping, behaviorByCowId);
+      await applyInitIds(
+        runId,
+        validMapping,
+        behaviorByCowId,
+        behaviorLabel2ByCowId,
+        behaviorLabel3ByCowId
+      );
       
       // Refresh progress after initialization
       const prog = await getProgress(runId);

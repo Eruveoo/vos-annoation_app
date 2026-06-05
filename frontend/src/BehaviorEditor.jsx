@@ -1,22 +1,37 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { getBehavior, setBehaviorLabel } from "./api.js";
-import { BEHAVIOR_LABELS, labelNameFi } from "./behaviorLabels.js";
+import {
+  BEHAVIOR_DIMENSIONS,
+  BEHAVIOR_DIMENSION_TITLES,
+  BEHAVIOR_LABELS_BY_DIMENSION,
+  labelNameFi,
+} from "./behaviorLabels.js";
+
+function parseLabelsAtFrame(raw) {
+  const at = {};
+  Object.entries(raw || {}).forEach(([k, v]) => {
+    at[Number(k)] = v;
+  });
+  return at;
+}
 
 /**
- * Edit per-cow behaviour labels from a given frame onward (segment-based).
+ * Edit per-cow behaviour labels (3 dimensions) from the video playhead frame onward.
  */
 export default function BehaviorEditor({
   runId,
-  defaultFrame = 0,
+  frame = 0,
   maxFrame = null,
-  videoFrame = null,
-  onLabelUpdated = null,
-  rebuildingPreview = false,
+  onLabelChanged = null,
+  disabled = false,
 }) {
-  const [frame, setFrame] = useState(defaultFrame);
   const [cowIds, setCowIds] = useState([]);
-  const [labelsAtFrame, setLabelsAtFrame] = useState({});
-  const [busyCowId, setBusyCowId] = useState(null);
+  const [labelsByDim, setLabelsByDim] = useState({
+    activity: {},
+    label2: {},
+    label3: {},
+  });
+  const [busyKey, setBusyKey] = useState(null);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
@@ -24,40 +39,47 @@ export default function BehaviorEditor({
     async (f) => {
       if (!runId) return;
       const data = await getBehavior(runId, f);
-      setCowIds(data.cow_ids || []);
-      const at = {};
-      Object.entries(data.labels_at_frame || {}).forEach(([k, v]) => {
-        at[Number(k)] = v;
+      const dims = data.dimensions || {};
+      const firstCowIds =
+        dims.activity?.cow_ids ||
+        dims.label2?.cow_ids ||
+        dims.label3?.cow_ids ||
+        data.cow_ids ||
+        [];
+      setCowIds(firstCowIds);
+      setLabelsByDim({
+        activity: parseLabelsAtFrame(dims.activity?.labels_at_frame),
+        label2: parseLabelsAtFrame(dims.label2?.labels_at_frame),
+        label3: parseLabelsAtFrame(dims.label3?.labels_at_frame),
       });
-      setLabelsAtFrame(at);
     },
     [runId]
   );
 
   useEffect(() => {
-    setFrame(defaultFrame);
-  }, [defaultFrame]);
-
-  useEffect(() => {
     loadAtFrame(frame).catch((e) => setError(e.message));
   }, [runId, frame, loadAtFrame]);
 
-  const handleLabelChange = async (cowId, labelId) => {
-    if (!labelId || labelsAtFrame[cowId] === labelId) return;
-    setBusyCowId(cowId);
+  const handleLabelChange = async (cowId, dimension, labelId) => {
+    const current = labelsByDim[dimension]?.[cowId];
+    if (!labelId || current === labelId) return;
+    const busy = `${dimension}-${cowId}`;
+    setBusyKey(busy);
     setError("");
     setSuccess("");
     try {
-      await setBehaviorLabel(runId, cowId, frame, labelId);
+      const res = await setBehaviorLabel(runId, cowId, frame, labelId, dimension);
       await loadAtFrame(frame);
+      const rebuildHint =
+        res.preview_in_sync === false ? " Rebuild golden preview to update video." : "";
       setSuccess(
-        `Cow ${cowId}: ${labelNameFi(labelId)} from frame ${frame}. Updating golden preview…`
+        `Cow ${cowId} · ${BEHAVIOR_DIMENSION_TITLES[dimension]}: ${labelNameFi(labelId, dimension)} from frame ${frame}.${rebuildHint}`
       );
-      onLabelUpdated?.();
+      onLabelChanged?.(dimension, res.preview_in_sync);
     } catch (e) {
       setError(e.message);
     } finally {
-      setBusyCowId(null);
+      setBusyKey(null);
     }
   };
 
@@ -81,106 +103,120 @@ export default function BehaviorEditor({
     >
       <h3 style={{ marginTop: 0, marginBottom: 8 }}>Behaviour labels</h3>
       <p style={{ fontSize: 13, color: "#6c757d", marginTop: 0, lineHeight: 1.5 }}>
-        Labels are drawn on the golden preview under each cow ID. Set the frame where the behaviour
-        changes, then pick a new label for that cow.
+        Scrub the golden video to the frame where behaviour changes. <strong>Label 1 (Aktivisuus)</strong> is
+        required; Labels 2 and 3 default to &quot;Ei valittu&quot; when not applicable.
       </p>
 
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-        <label style={{ fontSize: 14, fontWeight: 600 }}>From frame:</label>
-        <input
-          type="number"
-          min={0}
-          max={maxFrame ?? undefined}
-          value={frame}
-          onChange={(e) => setFrame(Math.max(0, parseInt(e.target.value, 10) || 0))}
+        <span style={{ fontSize: 14, fontWeight: 600 }}>From frame:</span>
+        <span
           style={{
-            width: 100,
-            padding: "8px 10px",
-            border: "1px solid #dee2e6",
+            padding: "8px 14px",
             borderRadius: 8,
-            fontSize: 14,
+            backgroundColor: "#e9ecef",
+            fontSize: 15,
+            fontWeight: 700,
+            fontVariantNumeric: "tabular-nums",
+            minWidth: 56,
+            textAlign: "center",
           }}
-        />
-        {videoFrame !== null && videoFrame !== undefined && (
-          <button
-            type="button"
-            onClick={() => setFrame(videoFrame)}
-            style={{
-              padding: "8px 12px",
-              fontSize: 13,
-              fontWeight: 600,
-              border: "1px solid #0d6efd",
-              borderRadius: 8,
-              background: "#fff",
-              color: "#0d6efd",
-              cursor: "pointer",
-            }}
-          >
-            Use video frame ({videoFrame})
-          </button>
-        )}
+        >
+          {frame}
+        </span>
         {maxFrame !== null && maxFrame !== undefined && (
-          <span style={{ fontSize: 12, color: "#6c757d" }}>(golden up to frame {maxFrame})</span>
+          <span style={{ fontSize: 12, color: "#6c757d" }}>(golden: 0–{maxFrame})</span>
         )}
       </div>
 
-      {rebuildingPreview && (
-        <div style={{ padding: 10, marginBottom: 12, backgroundColor: "#cff4fc", borderRadius: 8, color: "#055160", fontSize: 13 }}>
-          Rebuilding golden preview video…
-        </div>
-      )}
-
       {error && (
-        <div style={{ padding: 10, marginBottom: 12, backgroundColor: "#f8d7da", borderRadius: 8, color: "#721c24", fontSize: 13 }}>
+        <div
+          style={{
+            padding: 10,
+            marginBottom: 12,
+            backgroundColor: "#f8d7da",
+            borderRadius: 8,
+            color: "#721c24",
+            fontSize: 13,
+          }}
+        >
           {error}
         </div>
       )}
-      {success && !rebuildingPreview && (
-        <div style={{ padding: 10, marginBottom: 12, backgroundColor: "#d4edda", borderRadius: 8, color: "#155724", fontSize: 13 }}>
+      {success && (
+        <div
+          style={{
+            padding: 10,
+            marginBottom: 12,
+            backgroundColor: "#d4edda",
+            borderRadius: 8,
+            color: "#155724",
+            fontSize: 13,
+          }}
+        >
           {success}
         </div>
       )}
 
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-        <thead>
-          <tr style={{ backgroundColor: "#e9ecef" }}>
-            <th style={{ padding: 10, textAlign: "left", border: "1px solid #dee2e6" }}>Cow ID</th>
-            <th style={{ padding: 10, textAlign: "left", border: "1px solid #dee2e6" }}>Current at frame</th>
-            <th style={{ padding: 10, textAlign: "left", border: "1px solid #dee2e6" }}>Set new (from frame)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {cowIds.map((cowId) => (
-            <tr key={cowId}>
-              <td style={{ padding: 10, border: "1px solid #dee2e6", fontWeight: 600 }}>{cowId}</td>
-              <td style={{ padding: 10, border: "1px solid #dee2e6" }}>
-                {labelNameFi(labelsAtFrame[cowId] || "—")}
-              </td>
-              <td style={{ padding: 10, border: "1px solid #dee2e6" }}>
-                <select
-                  value={labelsAtFrame[cowId] || ""}
-                  disabled={busyCowId === cowId || rebuildingPreview}
-                  onChange={(e) => handleLabelChange(cowId, e.target.value)}
-                  style={{
-                    width: "100%",
-                    maxWidth: 280,
-                    padding: "6px 8px",
-                    borderRadius: 6,
-                    border: "1px solid #ccc",
-                    fontSize: 13,
-                  }}
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 720 }}>
+          <thead>
+            <tr style={{ backgroundColor: "#e9ecef" }}>
+              <th style={{ padding: 10, textAlign: "left", border: "1px solid #dee2e6", width: 70 }}>
+                Cow ID
+              </th>
+              {BEHAVIOR_DIMENSIONS.map((dim) => (
+                <th
+                  key={dim}
+                  style={{ padding: 10, textAlign: "left", border: "1px solid #dee2e6", minWidth: 200 }}
                 >
-                  {BEHAVIOR_LABELS.map((l) => (
-                    <option key={l.id} value={l.id} title={l.descriptionFi}>
-                      {l.nameFi}
-                    </option>
-                  ))}
-                </select>
-              </td>
+                  {BEHAVIOR_DIMENSION_TITLES[dim]}
+                  {dim !== "activity" && (
+                    <div style={{ fontSize: 11, fontWeight: 400, color: "#6c757d" }}>optional</div>
+                  )}
+                </th>
+              ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {cowIds.map((cowId) => (
+              <tr key={cowId}>
+                <td style={{ padding: 10, border: "1px solid #dee2e6", fontWeight: 600 }}>{cowId}</td>
+                {BEHAVIOR_DIMENSIONS.map((dim) => {
+                  const catalog = BEHAVIOR_LABELS_BY_DIMENSION[dim];
+                  const value = labelsByDim[dim]?.[cowId] || "";
+                  const busy = busyKey === `${dim}-${cowId}`;
+                  return (
+                    <td key={dim} style={{ padding: 8, border: "1px solid #dee2e6" }}>
+                      <div style={{ fontSize: 11, color: "#6c757d", marginBottom: 4 }}>
+                        Now: {labelNameFi(value || "—", dim)}
+                      </div>
+                      <select
+                        value={value}
+                        disabled={disabled || busy}
+                        onChange={(e) => handleLabelChange(cowId, dim, e.target.value)}
+                        style={{
+                          width: "100%",
+                          padding: "6px 8px",
+                          borderRadius: 6,
+                          border: "1px solid #ccc",
+                          fontSize: 12,
+                        }}
+                      >
+                        {!value && <option value="">—</option>}
+                        {catalog.map((l) => (
+                          <option key={l.id} value={l.id} title={l.descriptionFi}>
+                            {l.nameFi}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

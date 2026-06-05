@@ -11,13 +11,94 @@ import {
   getGoldenVideoUrl,
   downloadGolden,
   rebuildGoldenPreview,
+  getBehavior,
 } from "../api.js";
 import BehaviorEditor from "../BehaviorEditor.jsx";
+import BehaviorLabelsReference from "../BehaviorLabelsReference.jsx";
+import BehaviorTimeline from "../BehaviorTimeline.jsx";
 import { ANNOTATION_MODES } from "../behaviorLabels.js";
+
+function GoldenPreviewSyncStatus({ inSync, rebuilding }) {
+  if (rebuilding) {
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          fontSize: 13,
+          fontWeight: 600,
+          color: "#055160",
+        }}
+      >
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: "50%",
+            backgroundColor: "#0dcaf0",
+            boxShadow: "0 0 0 2px rgba(13, 202, 240, 0.35)",
+          }}
+        />
+        Rebuilding preview…
+      </span>
+    );
+  }
+
+  if (inSync) {
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          fontSize: 13,
+          fontWeight: 600,
+          color: "#155724",
+        }}
+      >
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: "50%",
+            backgroundColor: "#28a745",
+            boxShadow: "0 0 0 2px rgba(40, 167, 69, 0.35)",
+          }}
+        />
+        Preview in sync with labels
+      </span>
+    );
+  }
+
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        fontSize: 13,
+        fontWeight: 600,
+        color: "#842029",
+      }}
+    >
+      <span
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: "50%",
+          backgroundColor: "#dc3545",
+          boxShadow: "0 0 0 2px rgba(220, 53, 69, 0.35)",
+        }}
+      />
+      Preview out of sync — rebuild required
+    </span>
+  );
+}
 
 export default function MainWorkspacePage({ runId, frame0Image, annotationMode, onProgressUpdate }) {
   const isBehaviorMode = annotationMode === ANNOTATION_MODES.BEHAVIOR;
-  const [activeTab, setActiveTab] = useState("tracking"); // Default to tracking
+  const [activeTab, setActiveTab] = useState("tracking");
   const [nFrames, setNFrames] = useState(50);
   const [autoResetInterval, setAutoResetInterval] = useState("");
   const [busy, setBusy] = useState(false);
@@ -26,7 +107,10 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
   const [trackedVideoUrl, setTrackedVideoUrl] = useState(null);
   const [goldenVideoUrl, setGoldenVideoUrl] = useState(null);
   const [goldenPlaybackFrame, setGoldenPlaybackFrame] = useState(0);
+  const [goldenPreviewInSync, setGoldenPreviewInSync] = useState(true);
   const [rebuildingPreview, setRebuildingPreview] = useState(false);
+  const [behaviorTimelineRefresh, setBehaviorTimelineRefresh] = useState(0);
+  const goldenVideoRef = React.useRef(null);
   const [trackProgress, setTrackProgress] = useState(0);
   const [trackMessage, setTrackMessage] = useState("");
   const [isTracking, setIsTracking] = useState(false);
@@ -39,12 +123,26 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
     goldenMaxIdx: null,
   });
 
-  // Load initial progress
+  const loadBehaviorSyncStatus = React.useCallback(async () => {
+    if (!runId || !isBehaviorMode) return;
+    try {
+      const data = await getBehavior(runId);
+      setGoldenPreviewInSync(data.preview_in_sync !== false);
+    } catch (e) {
+      console.error("Failed to load behaviour sync status:", e);
+    }
+  }, [runId, isBehaviorMode]);
+
   React.useEffect(() => {
     if (runId) {
       loadProgress();
+      loadBehaviorSyncStatus();
     }
   }, [runId]);
+
+  React.useEffect(() => {
+    loadBehaviorSyncStatus();
+  }, [loadBehaviorSyncStatus, isBehaviorMode]);
 
   const loadProgress = async () => {
     try {
@@ -73,7 +171,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
     setIsTracking(true);
     setError("");
     setSuccess("");
-    // Initialize progress immediately so it shows right away
     setTrackProgress(0);
     setTrackMessage("Preparing to track...");
 
@@ -83,8 +180,8 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
         throw new Error("Auto-reset interval must be a positive number");
       }
 
-      await trackFrames(runId, nFrames, resetVal, (progress, message, stage) => {
-        setTrackProgress(progress);
+      await trackFrames(runId, nFrames, resetVal, (progressVal, message) => {
+        setTrackProgress(progressVal);
         setTrackMessage(message || "");
       });
       await loadProgress();
@@ -93,7 +190,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
       }, 500);
       setTrackProgress(100);
       setTrackMessage("Completed");
-      // Clear progress after a moment
       setTimeout(() => {
         setTrackProgress(0);
         setTrackMessage("");
@@ -112,10 +208,9 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
 
   const handleCommit = async () => {
     setBusy(true);
-    setIsTracking(false); // Not tracking during commit
+    setIsTracking(false);
     setError("");
     setSuccess("");
-    // Clear tracking progress during commit (commit doesn't use tracking progress)
     setTrackProgress(0);
     setTrackMessage("");
 
@@ -123,6 +218,9 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
       await commitFrames(runId);
       await loadProgress();
       setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
+      if (isBehaviorMode) {
+        setGoldenPreviewInSync(false);
+      }
       setSuccess(`✅ Committed! Progress: ${progress.processed}/${progress.total} frames`);
     } catch (e) {
       setError(`Failed to commit: ${e.message}`);
@@ -137,37 +235,34 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
     }
   };
 
-  const handleBehaviorLabelUpdated = async () => {
-    setRebuildingPreview(true);
-    try {
-      refreshGoldenVideo();
-    } finally {
-      setTimeout(() => setRebuildingPreview(false), 800);
+  const handleBehaviorLabelChanged = (_dimension, previewInSync) => {
+    setBehaviorTimelineRefresh((n) => n + 1);
+    if (previewInSync === false) {
+      setGoldenPreviewInSync(false);
     }
+  };
+
+  const handleTimelineSeek = (frame) => {
+    setGoldenPlaybackFrame(frame);
+    goldenVideoRef.current?.seekToFrame(frame);
   };
 
   const handleRebuildGoldenPreview = async () => {
     if (!runId) return;
     setRebuildingPreview(true);
     setError("");
+    setSuccess("");
     try {
       await rebuildGoldenPreview(runId);
       refreshGoldenVideo();
-      setSuccess("Golden preview updated with behaviour labels.");
+      setGoldenPreviewInSync(true);
+      setBehaviorTimelineRefresh((n) => n + 1);
+      setSuccess("Golden preview rebuilt and is in sync with behaviour labels.");
     } catch (e) {
       setError(`Failed to rebuild golden preview: ${e.message}`);
     } finally {
       setRebuildingPreview(false);
     }
-  };
-
-  const behaviorEditorProps = {
-    runId,
-    defaultFrame: progress.goldenMaxIdx ?? 0,
-    maxFrame: progress.goldenMaxIdx,
-    videoFrame: goldenPlaybackFrame,
-    onLabelUpdated: handleBehaviorLabelUpdated,
-    rebuildingPreview,
   };
 
   const handleDownloadGolden = async () => {
@@ -195,7 +290,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
     <div style={{ maxWidth: 1400, margin: "0 auto", padding: 24 }}>
       <h1 style={{ marginTop: 0, marginBottom: 32 }}>VOS Annotation App</h1>
 
-      {/* Run info header */}
       <div
         style={{
           padding: 16,
@@ -230,7 +324,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
         </div>
       </div>
 
-      {/* Tabs */}
       <div style={{ marginBottom: 24, borderBottom: "2px solid #dee2e6" }}>
         <div style={{ display: "flex", gap: 8 }}>
           {tabs.map((tab) => (
@@ -256,7 +349,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
         </div>
       </div>
 
-      {/* Error/Success messages */}
       {error && (
         <div
           style={{
@@ -286,7 +378,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
         </div>
       )}
 
-      {/* Tab content */}
       <div
         style={{
           backgroundColor: "#fff",
@@ -300,15 +391,13 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
           <div>
             <h2 style={{ marginTop: 0, marginBottom: 24 }}>Tracking</h2>
 
-            {/* Progress */}
             <div style={{ marginBottom: 24, padding: 16, backgroundColor: "#f8f9fa", borderRadius: 8 }}>
               <ProgressDisplay processed={progress.processed} total={progress.total} percent={progress.percent} />
             </div>
 
-            {/* Tracking controls */}
             <div style={{ marginBottom: 24, padding: 16, backgroundColor: "#f8f9fa", borderRadius: 8 }}>
               <h3 style={{ marginTop: 0 }}>Track New Frames</h3>
-              
+
               <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 16 }}>
                 <div>
                   <label style={{ display: "block", marginBottom: 4, fontSize: 14, fontWeight: 500 }}>
@@ -385,12 +474,11 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
               </div>
             </div>
 
-            {/* Video previews */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
               <div>
-                <VideoPlayer 
-                  videoUrl={trackedVideoUrl} 
-                  label="Tracked chunk preview (current)" 
+                <VideoPlayer
+                  videoUrl={trackedVideoUrl}
+                  label="Tracked chunk preview (current)"
                   height={480}
                   progress={isTracking ? trackProgress : null}
                   progressMessage={isTracking ? trackMessage : null}
@@ -401,36 +489,28 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
                   videoUrl={goldenVideoUrl}
                   label="Golden preview (committed so far)"
                   height={480}
-                  fps={progress.fps}
-                  onPlaybackFrame={isBehaviorMode ? setGoldenPlaybackFrame : null}
                 />
               </div>
             </div>
 
-            {isBehaviorMode && runId && goldenVideoUrl && (
-              <>
-                <BehaviorEditor {...behaviorEditorProps} />
-                <button
-                  type="button"
-                  onClick={handleRebuildGoldenPreview}
-                  disabled={busy || rebuildingPreview}
-                  style={{
-                    marginTop: 8,
-                    padding: "8px 14px",
-                    fontSize: 13,
-                    fontWeight: 600,
-                    border: "1px solid #6c757d",
-                    borderRadius: 8,
-                    background: "#fff",
-                    cursor: busy || rebuildingPreview ? "not-allowed" : "pointer",
-                  }}
-                >
-                  {rebuildingPreview ? "Rebuilding preview…" : "Rebuild golden preview (refresh labels on video)"}
-                </button>
-              </>
+            {isBehaviorMode && (
+              <p
+                style={{
+                  marginTop: 16,
+                  fontSize: 13,
+                  color: "#6c757d",
+                  lineHeight: 1.5,
+                  padding: "12px 14px",
+                  backgroundColor: "#f8f9fa",
+                  borderRadius: 8,
+                  border: "1px solid #e9ecef",
+                }}
+              >
+                Behaviour labels are edited on the <strong>Golden</strong> tab after you finish tracking and
+                committing masks.
+              </p>
             )}
 
-            {/* Corrections section */}
             <div style={{ marginTop: 48, paddingTop: 32, borderTop: "2px solid #dee2e6" }}>
               <h2 style={{ marginTop: 0, marginBottom: 24 }}>Corrections</h2>
               {runId && progress.fps !== null && (
@@ -455,8 +535,16 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
         {activeTab === "golden" && (
           <div>
             <h2 style={{ marginTop: 0, marginBottom: 24 }}>Golden Preview</h2>
+
+            {isBehaviorMode && goldenVideoUrl && (
+              <div style={{ marginBottom: 12 }}>
+                <GoldenPreviewSyncStatus inSync={goldenPreviewInSync} rebuilding={rebuildingPreview} />
+              </div>
+            )}
+
             <div style={{ marginBottom: 24 }}>
               <VideoPlayer
+                ref={isBehaviorMode ? goldenVideoRef : null}
                 videoUrl={goldenVideoUrl}
                 label="Golden video (all committed frames)"
                 height={600}
@@ -464,27 +552,56 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
                 onPlaybackFrame={isBehaviorMode ? setGoldenPlaybackFrame : null}
               />
             </div>
-            {isBehaviorMode && runId && (
+
+            {isBehaviorMode &&
+              runId &&
+              goldenVideoUrl &&
+              progress.goldenMaxIdx !== null &&
+              progress.goldenMaxIdx !== undefined && (
+                <BehaviorTimeline
+                  runId={runId}
+                  maxFrame={progress.goldenMaxIdx}
+                  currentFrame={goldenPlaybackFrame}
+                  onSeekFrame={handleTimelineSeek}
+                  refreshToken={behaviorTimelineRefresh}
+                />
+              )}
+
+            {isBehaviorMode && runId && goldenVideoUrl && (
               <>
-                <BehaviorEditor {...behaviorEditorProps} />
                 <button
                   type="button"
                   onClick={handleRebuildGoldenPreview}
-                  disabled={busy || rebuildingPreview}
+                  disabled={busy || rebuildingPreview || goldenPreviewInSync}
                   style={{
-                    marginTop: 8,
                     marginBottom: 16,
-                    padding: "8px 14px",
-                    fontSize: 13,
+                    padding: "10px 18px",
+                    fontSize: 14,
                     fontWeight: 600,
-                    border: "1px solid #6c757d",
+                    border: "none",
                     borderRadius: 8,
-                    background: "#fff",
-                    cursor: busy || rebuildingPreview ? "not-allowed" : "pointer",
+                    background: goldenPreviewInSync ? "#e9ecef" : "#0d6efd",
+                    color: goldenPreviewInSync ? "#6c757d" : "white",
+                    cursor: busy || rebuildingPreview || goldenPreviewInSync ? "not-allowed" : "pointer",
+                    width: "100%",
                   }}
                 >
-                  {rebuildingPreview ? "Rebuilding preview…" : "Rebuild golden preview (refresh labels on video)"}
+                  {rebuildingPreview
+                    ? "Rebuilding golden preview…"
+                    : goldenPreviewInSync
+                      ? "Golden preview is up to date"
+                      : "Rebuild golden preview (apply labels to video)"}
                 </button>
+
+                <BehaviorEditor
+                  runId={runId}
+                  frame={goldenPlaybackFrame}
+                  maxFrame={progress.goldenMaxIdx}
+                  onLabelChanged={handleBehaviorLabelChanged}
+                  disabled={rebuildingPreview}
+                />
+
+                <BehaviorLabelsReference />
               </>
             )}
 
