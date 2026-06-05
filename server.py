@@ -9,6 +9,7 @@ import base64
 import tempfile
 import threading
 import zipfile
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
@@ -103,12 +104,44 @@ VIDEO_NAME = "video1"
 JPEG_QUALITY = 90
 MASK_THRESHOLD = 0.5
 
+# Dynamically detect project number from the current file's path
+# This handles different users with different project codes (e.g., 2015338, 2016918, etc.)
+def _get_project_number() -> Optional[str]:
+    """Extract project number from the server.py file path (e.g., 'project_2015338' -> '2015338')"""
+    try:
+        # Get the directory containing this script
+        server_dir = Path(__file__).resolve().parent
+        # Search up the path for a directory matching project_XXXXX pattern
+        for parent in [server_dir] + list(server_dir.parents):
+            match = re.search(r'project_(\d+)', str(parent))
+            if match:
+                return match.group(1)
+    except Exception as e:
+        log.debug(f"Could not extract project number: {e}")
+    return None
+
 # Use scratch space (has most room for files):
 # - Home: 10GB space, 100K files (9.1G used, 6K files - space tight)
 # - Scratch: 4TB space, 1M files (54G used, 210K files - PLENTY OF ROOM!)
 # - Projappl: 50GB space, 100K files (21G used, 101K files - FILE LIMIT EXCEEDED!)
-RUNS_ROOT = Path("/scratch/project_2016918/vos_annotation_runs")
-RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+# Dynamically construct the scratch path based on the current user's project code
+_project_num = _get_project_number()
+if _project_num:
+    _scratch_path = Path(f"/scratch/project_{_project_num}/vos_annotation_runs")
+    log.info(f"Detected project number: {_project_num}")
+else:
+    _scratch_path = Path("/scratch/vos_annotation_runs")
+    log.warning("Could not detect project number from path, using generic scratch path")
+
+try:
+    _scratch_path.mkdir(parents=True, exist_ok=True)
+    RUNS_ROOT = _scratch_path
+    log.info(f"Using scratch directory: {RUNS_ROOT}")
+except PermissionError:
+    # Fall back to local "runs" directory if scratch is not writable
+    RUNS_ROOT = Path("./runs")
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    log.warning(f"Scratch path {_scratch_path} not writable, falling back to local runs directory: {RUNS_ROOT}")
 
 # Progress tracking for upload/prepare operations
 # Key: run_id, Value: {"stage": "upload"|"extract", "progress": 0-100, "message": str}
