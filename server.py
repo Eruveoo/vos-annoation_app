@@ -1083,6 +1083,71 @@ def _ensure_sam3_assets():
         pkg_resources.resource_filename = patched_fn
 
 
+def _cast_module_float32(module: torch.nn.Module) -> torch.nn.Module:
+    """Force all floating-point weights/buffers to float32 (avoids bf16/float32 matmul errors)."""
+    module.eval()
+    module.float()
+    for param in module.parameters(recurse=True):
+        if param.data is not None and param.data.is_floating_point():
+            param.data = param.data.float()
+    for buf in module.buffers(recurse=True):
+        if buf.is_floating_point():
+            buf.data = buf.data.float()
+    return module
+
+
+def _is_sam3_dtype_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "bfloat16" in msg
+        or "bf16" in msg
+        or ("dtype" in msg and "float" in msg)
+        or "bias type" in msg
+    )
+
+
+def _reset_sam3_image_model() -> None:
+    global MODEL, PROCESSOR
+    MODEL = None
+    PROCESSOR = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def infer_sam3_text_prompt(processor: Sam3Processor, img: Image.Image, prompt: str) -> Dict[str, Any]:
+    """
+    Run SAM-3 text segmentation with autocast disabled and float32 weights.
+    Retries once after full model reload on BFloat16/float dtype mismatches.
+    """
+    global MODEL, PROCESSOR
+    last_err: Optional[BaseException] = None
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+    for attempt in range(2):
+        model = getattr(processor, "model", MODEL)
+        if model is not None:
+            _cast_module_float32(model)
+        try:
+            with torch.inference_mode():
+                with torch.autocast(device_type=device_type, enabled=False):
+                    state = processor.set_image(img)
+                    return processor.set_text_prompt(state=state, prompt=prompt)
+        except RuntimeError as e:
+            last_err = e
+            if _is_sam3_dtype_error(e) and attempt == 0:
+                log.warning(
+                    f"[SAM3] dtype mismatch on attempt {attempt + 1}, reloading model: {e}"
+                )
+                _reset_sam3_image_model()
+                processor = get_model()
+                continue
+            raise
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("SAM-3 inference failed without a captured error")
+
+
 def get_model():
     global MODEL, PROCESSOR
     if MODEL is None:
@@ -1090,11 +1155,9 @@ def get_model():
         t0 = time.perf_counter()
         _ensure_sam3_assets()
         MODEL = build_sam3_image_model()
-        # Ensure model is in float32 to avoid dtype mismatch errors
-        # (some systems/GPUs may load models in BFloat16 by default)
-        MODEL = MODEL.float()
+        _cast_module_float32(MODEL)
         PROCESSOR = Sam3Processor(MODEL)
-        log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s")
+        log.info(f"SAM-3 loaded in {time.perf_counter() - t0:.2f}s (float32)")
     return PROCESSOR
 
 
@@ -1110,9 +1173,11 @@ def get_video_predictor(force_reinit=False):
         _ensure_sam3_assets()
         gpu_ids = [torch.cuda.current_device()] if torch.cuda.is_available() else []
         VIDEO_PREDICTOR = build_sam3_video_predictor(gpus_to_use=gpu_ids)
-        # Ensure model is in float32 to avoid dtype mismatch errors
-        VIDEO_PREDICTOR = VIDEO_PREDICTOR.float()
-        log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s")
+        if isinstance(VIDEO_PREDICTOR, torch.nn.Module):
+            _cast_module_float32(VIDEO_PREDICTOR)
+        elif hasattr(VIDEO_PREDICTOR, "float"):
+            VIDEO_PREDICTOR = VIDEO_PREDICTOR.float()
+        log.info(f"SAM-3 video predictor loaded in {time.perf_counter() - t0:.2f}s (float32)")
     return VIDEO_PREDICTOR
 
 
@@ -1632,12 +1697,11 @@ def run_sam3_on_frame(prompt: str, frame_path: Path) -> list:
     
     log.info(f"SAM-3 on frame {frame_path}, prompt={prompt}")
     processor = get_model()
-    
+
     img = Image.open(frame_path).convert("RGB")
     W, H = img.size
-    
-    state = processor.set_image(img)
-    out = processor.set_text_prompt(state=state, prompt=prompt)
+
+    out = infer_sam3_text_prompt(processor, img, prompt)
     
     log.info(f"SAM-3 raw masks: {len(out['masks'])}")
     
@@ -1664,8 +1728,7 @@ def run_sam3_on_first_frame(prompt, jpeg_dir, ann_dir, frames):
     img = Image.open(first_path).convert("RGB")
     W, H = img.size
 
-    state = processor.set_image(img)
-    out = processor.set_text_prompt(state=state, prompt=prompt)
+    out = infer_sam3_text_prompt(processor, img, prompt)
 
     log.info(f"SAM-3 raw masks: {len(out['masks'])}")
 
@@ -2385,26 +2448,20 @@ def init_sam(run_id: str, prompt: str):
 
     # Run SAM-3 on frame 0 (EXACTLY like /init)
     log.info(f"[INIT_SAM] Running SAM-3 on frame 0, prompt={prompt}")
-    processor = get_model()
     first_path = jpeg_dir / frames[0]
+    try:
+        masks = run_sam3_on_frame(prompt, first_path)
+    except RuntimeError as e:
+        if _is_sam3_dtype_error(e):
+            log.error(f"[INIT_SAM] SAM-3 dtype error: {e}")
+            raise HTTPException(
+                500,
+                "SAM-3 failed due to a GPU dtype mismatch (BFloat16 vs Float). "
+                "Restart the server and try again; if it persists, ask the admin to pull the latest server.py.",
+            ) from e
+        raise
+
     img = Image.open(first_path).convert("RGB")
-    W, H = img.size
-
-    state = processor.set_image(img)
-    out = processor.set_text_prompt(state=state, prompt=prompt)
-
-    log.info(f"[INIT_SAM] SAM-3 raw masks: {len(out['masks'])}")
-
-    masks = []
-    for m in out["masks"]:
-        mask = m.squeeze().cpu().numpy()
-        mask = np.array(Image.fromarray(mask).resize((W, H), Image.NEAREST)) > MASK_THRESHOLD
-        if mask.sum() > 500:
-            masks.append(mask)
-
-    if not masks:
-        raise RuntimeError("No valid masks from SAM-3")
-
     n_masks = len(masks)
     log.info(f"[INIT_SAM] SAM-3 kept {n_masks} masks")
 
