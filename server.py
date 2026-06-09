@@ -50,15 +50,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Progress endpoints polled frequently — omit from request/access logs.
+_QUIET_LOG_PATH_PREFIXES = (
+    "/prepare_upload_progress/",
+    "/track_progress/",
+)
+
+
+class _QuietAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(prefix in msg for prefix in _QUIET_LOG_PATH_PREFIXES)
+
+
 # -------------------------
 # Request logging middleware
 # -------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    path = request.url.path
+    quiet = any(path.startswith(prefix) for prefix in _QUIET_LOG_PATH_PREFIXES)
     t0 = time.perf_counter()
     response = await call_next(request)
-    dt = (time.perf_counter() - t0) * 1000
-    log.info(f"{request.method} {request.url.path} -> {response.status_code} ({dt:.1f} ms)")
+    if not quiet:
+        dt = (time.perf_counter() - t0) * 1000
+        log.info(f"{request.method} {path} -> {response.status_code} ({dt:.1f} ms)")
     return response
 
 
@@ -67,7 +83,9 @@ async def log_requests(request: Request, call_next):
 # -------------------------
 @app.on_event("startup")
 async def startup_load_ffmpeg():
-    """Automatically load ffmpeg module if ffmpeg is not found in PATH."""
+    """Startup: quiet access logs for poll endpoints; load ffmpeg if missing."""
+    logging.getLogger("uvicorn.access").addFilter(_QuietAccessLogFilter())
+
     if shutil.which("ffmpeg"):
         return
     
@@ -565,8 +583,29 @@ def load_behavior_dimension(run_dir: Path, dimension: str) -> Optional[Dict[str,
         return json.load(f)
 
 
+def _sort_behavior_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(segments, key=lambda s: (int(s["cow_id"]), int(s["start_frame"])))
+
+
+def _prune_invalid_behavior_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    pruned: List[Dict[str, Any]] = []
+    for seg in segments:
+        start = int(seg["start_frame"])
+        end = seg.get("end_frame")
+        if end is not None and int(end) < start:
+            continue
+        pruned.append(seg)
+    return pruned
+
+
+def _normalize_behavior_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _sort_behavior_segments(_prune_invalid_behavior_segments(segments))
+
+
 def save_behavior_dimension(run_dir: Path, dimension: str, data: Dict[str, Any]) -> None:
     path = behavior_file_path(run_dir, dimension)
+    data = dict(data)
+    data["segments"] = _normalize_behavior_segments(data.get("segments", []))
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -628,11 +667,52 @@ def create_initial_segments(
     return empty_behavior_data(cow_ids, dimension) | {"segments": segments}
 
 
-def _close_open_behavior_segment(segments: List[Dict[str, Any]], cow_id: int, end_frame: int) -> None:
-    for seg in reversed(segments):
-        if seg["cow_id"] == cow_id and seg.get("end_frame") is None:
-            seg["end_frame"] = int(end_frame)
-            return
+def _find_covering_behavior_segment(
+    segments: List[Dict[str, Any]], cow_id: int, frame: int
+) -> Optional[Dict[str, Any]]:
+    best: Optional[Dict[str, Any]] = None
+    for seg in segments:
+        if int(seg["cow_id"]) != cow_id:
+            continue
+        start = int(seg["start_frame"])
+        end = seg.get("end_frame")
+        if frame < start:
+            continue
+        if end is not None and frame > int(end):
+            continue
+        if best is None or start >= int(best["start_frame"]):
+            best = seg
+    return best
+
+
+def _next_behavior_segment_start(
+    segments: List[Dict[str, Any]], cow_id: int, frame: int
+) -> Optional[int]:
+    starts = [
+        int(s["start_frame"])
+        for s in segments
+        if int(s["cow_id"]) == cow_id and int(s["start_frame"]) > frame
+    ]
+    return min(starts) if starts else None
+
+
+def _append_behavior_segment(
+    segments: List[Dict[str, Any]],
+    cow_id: int,
+    start_frame: int,
+    end_frame: Optional[int],
+    label_id: str,
+    dimension: str,
+) -> None:
+    segments.append(
+        {
+            "cow_id": int(cow_id),
+            "start_frame": int(start_frame),
+            "end_frame": int(end_frame) if end_frame is not None else None,
+            "label_id": label_id,
+            "visible": _segment_visible(label_id, dimension),
+        }
+    )
 
 
 def set_label_from_frame(
@@ -643,7 +723,8 @@ def set_label_from_frame(
     dimension: str = "activity",
 ) -> Dict[str, Any]:
     """
-    Close the current open segment for cow_id (if any) at frame-1, then start a new segment at frame.
+    Set label for cow_id from frame onward. Splits an existing segment when frame falls
+    in the middle (e.g. A on 0–30, B on 30+, then C at 15 → 0–14 A, 15–29 C, 30+ B).
     """
     _validate_behavior_label_id(label_id, dimension)
     frame = int(frame)
@@ -651,31 +732,78 @@ def set_label_from_frame(
     segments: List[Dict[str, Any]] = list(data.get("segments", []))
 
     for seg in segments:
-        if seg["cow_id"] == cow_id and seg.get("end_frame") is None and seg["start_frame"] == frame:
+        if int(seg["cow_id"]) == cow_id and int(seg["start_frame"]) == frame:
             seg["label_id"] = label_id
             seg["visible"] = _segment_visible(label_id, dimension)
-            data["segments"] = segments
+            data["segments"] = _normalize_behavior_segments(segments)
             if cow_id not in data.get("cow_ids", []):
                 data.setdefault("cow_ids", []).append(cow_id)
                 data["cow_ids"] = sorted(data["cow_ids"])
             return data
 
-    if frame > 0:
-        _close_open_behavior_segment(segments, cow_id, frame - 1)
+    covering = _find_covering_behavior_segment(segments, cow_id, frame)
+    next_start = _next_behavior_segment_start(segments, cow_id, frame)
 
-    segments.append(
-        {
-            "cow_id": cow_id,
-            "start_frame": frame,
-            "end_frame": None,
-            "label_id": label_id,
-            "visible": _segment_visible(label_id, dimension),
-        }
-    )
-    data["segments"] = segments
+    if covering is not None and int(covering["start_frame"]) < frame:
+        cover_end = covering.get("end_frame")
+        covering["end_frame"] = frame - 1
+        if next_start is not None:
+            new_end = next_start - 1
+        elif cover_end is not None:
+            new_end = int(cover_end)
+        else:
+            new_end = None
+        _append_behavior_segment(segments, cow_id, frame, new_end, label_id, dimension)
+    else:
+        new_end = (next_start - 1) if next_start is not None else None
+        _append_behavior_segment(segments, cow_id, frame, new_end, label_id, dimension)
+
+    data["segments"] = _normalize_behavior_segments(segments)
     cow_ids_set = set(data.get("cow_ids", []))
     cow_ids_set.add(cow_id)
     data["cow_ids"] = sorted(cow_ids_set)
+    return data
+
+
+def delete_label_from_frame(
+    data: Dict[str, Any],
+    cow_id: int,
+    frame: int,
+    dimension: str = "activity",
+) -> Dict[str, Any]:
+    """
+    Remove a behaviour change that starts at frame (undo split). Extends the previous
+    segment to cover the deleted segment's range.
+    """
+    frame = int(frame)
+    cow_id = int(cow_id)
+    if frame <= 0:
+        raise ValueError("Cannot delete the initial behaviour at frame 0")
+
+    segments: List[Dict[str, Any]] = list(data.get("segments", []))
+    target_idx: Optional[int] = None
+    for i, seg in enumerate(segments):
+        if int(seg["cow_id"]) == cow_id and int(seg["start_frame"]) == frame:
+            target_idx = i
+            break
+    if target_idx is None:
+        raise ValueError(f"No behaviour change at frame {frame} for cow {cow_id}")
+
+    deleted = segments.pop(target_idx)
+    deleted_end = deleted.get("end_frame")
+
+    prev: Optional[Dict[str, Any]] = None
+    for seg in segments:
+        if int(seg["cow_id"]) != cow_id:
+            continue
+        if int(seg["start_frame"]) < frame:
+            if prev is None or int(seg["start_frame"]) > int(prev["start_frame"]):
+                prev = seg
+    if prev is None:
+        raise ValueError("Cannot delete: no preceding segment")
+
+    prev["end_frame"] = int(deleted_end) if deleted_end is not None else None
+    data["segments"] = _normalize_behavior_segments(segments)
     return data
 
 
@@ -2497,6 +2625,12 @@ class BehaviorSetLabelPayload(BaseModel):
     dimension: str = "activity"
 
 
+class BehaviorDeleteLabelPayload(BaseModel):
+    cow_id: int
+    frame: int
+    dimension: str = "activity"
+
+
 class PreviewUpdate(BaseModel):
     mapping: Dict[str, int]  # mask_index -> final_id (0 means delete)
 
@@ -2809,6 +2943,48 @@ def behavior_set_label(run_id: str, payload: BehaviorSetLabelPayload):
         "label_id": payload.label_id,
         "preview_in_sync": preview_in_sync,
         "label_at_frame": labels_at,
+        "labels_at_frame": labels_at,
+    }
+
+
+@app.post("/behavior/{run_id}/delete_label")
+def behavior_delete_label(run_id: str, payload: BehaviorDeleteLabelPayload):
+    run_dir = RUNS_ROOT / run_id
+    if not (run_dir / "meta.txt").exists():
+        raise HTTPException(404, "run_id not found")
+    if get_annotation_mode(run_dir) != "behavior":
+        raise HTTPException(400, "Run is not in behavior annotation mode")
+    dimension = (payload.dimension or "activity").strip().lower()
+    if dimension not in BEHAVIOR_DIMENSIONS:
+        raise HTTPException(400, f"dimension must be one of {BEHAVIOR_DIMENSIONS}")
+    data = load_behavior_dimension(run_dir, dimension)
+    if not data:
+        raise HTTPException(400, "No behavior data for this run; complete ID assignment first")
+    if payload.frame < 0:
+        raise HTTPException(400, "frame must be >= 0")
+    try:
+        delete_label_from_frame(data, payload.cow_id, payload.frame, dimension)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    save_behavior_dimension(run_dir, dimension, data)
+    preview_in_sync = None
+    if BEHAVIOR_DIMENSION_META[dimension]["affects_preview"]:
+        mark_behavior_preview_out_of_sync(run_dir)
+        activity_data = load_behavior_dimension(run_dir, "activity")
+        preview_in_sync = bool(activity_data.get("preview_in_sync", False)) if activity_data else False
+    log.info(
+        f"[BEHAVIOR] delete_label run_id={run_id} dim={dimension} cow_id={payload.cow_id} "
+        f"frame={payload.frame}"
+    )
+    labels_at = {
+        str(k): v for k, v in labels_at_frame(data, payload.frame).items()
+    }
+    return {
+        "run_id": run_id,
+        "dimension": dimension,
+        "cow_id": payload.cow_id,
+        "frame": payload.frame,
+        "preview_in_sync": preview_in_sync,
         "labels_at_frame": labels_at,
     }
 
@@ -6234,6 +6410,106 @@ def paths(run_id: str):
     }
 
 
+def _golden_mask_presence_by_cow(
+    run_dir: Path, cow_ids: List[int], max_frame: int
+) -> Dict[int, set]:
+    """Frames where each cow_id has at least one pixel in golden annotation masks."""
+    golden_ann_dir = get_golden_ann_dir(run_dir)
+    present: Dict[int, set] = {int(c): set() for c in cow_ids}
+    for frame_idx in range(0, max_frame + 1):
+        ann_path = golden_ann_dir / f"{frame_idx:05d}.png"
+        if not ann_path.exists():
+            continue
+        arr = np.array(Image.open(ann_path))
+        for cow_id in cow_ids:
+            if np.any(arr == int(cow_id)):
+                present[int(cow_id)].add(frame_idx)
+    return present
+
+
+def _segments_from_frame_labels(
+    cow_id: int,
+    frame_labels: Dict[int, str],
+    dimension: str,
+    max_frame: int,
+) -> List[Dict[str, Any]]:
+    """Run-length encode per-frame labels into contiguous segments."""
+    segments: List[Dict[str, Any]] = []
+    current_label: Optional[str] = None
+    start: Optional[int] = None
+    for frame_idx in range(0, max_frame + 1):
+        label = frame_labels.get(frame_idx)
+        if label is None:
+            continue
+        if label != current_label:
+            if current_label is not None and start is not None:
+                _append_behavior_segment(
+                    segments, cow_id, start, frame_idx - 1, current_label, dimension
+                )
+            current_label = label
+            start = frame_idx
+    if current_label is not None and start is not None:
+        _append_behavior_segment(segments, cow_id, start, None, current_label, dimension)
+    return segments
+
+
+def sync_activity_visibility_from_masks(run_dir: Path) -> bool:
+    """
+    Rebuild activity segments so frames without a golden mask for a cow use not_visible.
+    Present frames keep the annotator's labels. Called before golden zip export.
+    """
+    if get_annotation_mode(run_dir) != "behavior":
+        return False
+    data = load_behavior_dimension(run_dir, "activity")
+    if not data:
+        return False
+
+    golden_ann_dir = get_golden_ann_dir(run_dir)
+    if not golden_ann_dir.exists():
+        return False
+    pngs = sorted(golden_ann_dir.glob("*.png"))
+    if not pngs:
+        return False
+
+    max_frame = max(int(p.stem) for p in pngs)
+    cow_ids = [int(c) for c in data.get("cow_ids", [])]
+    if not cow_ids:
+        return False
+
+    before = json.dumps(data.get("segments", []), sort_keys=True)
+    presence = _golden_mask_presence_by_cow(run_dir, cow_ids, max_frame)
+    default_label = _default_label_for_dimension("activity")
+    original_segments = list(data.get("segments", []))
+    original_data = dict(data)
+    original_data["segments"] = original_segments
+
+    new_segments: List[Dict[str, Any]] = []
+    for cow_id in cow_ids:
+        frame_labels: Dict[int, str] = {}
+        for frame_idx in range(0, max_frame + 1):
+            if frame_idx not in presence.get(cow_id, set()):
+                frame_labels[frame_idx] = NOT_VISIBLE_LABEL_ID
+            else:
+                label = get_behavior_label_at_frame(original_data, cow_id, frame_idx)
+                frame_labels[frame_idx] = label if label is not None else default_label
+        new_segments.extend(
+            _segments_from_frame_labels(cow_id, frame_labels, "activity", max_frame)
+        )
+
+    data["segments"] = _normalize_behavior_segments(new_segments)
+    after = json.dumps(data["segments"], sort_keys=True)
+    if before == after:
+        return False
+
+    save_behavior_dimension(run_dir, "activity", data)
+    mark_behavior_preview_out_of_sync(run_dir)
+    log.info(
+        f"[BEHAVIOR] sync_activity_visibility_from_masks run_dir={run_dir.name} "
+        f"cows={cow_ids} frames=0..{max_frame}"
+    )
+    return True
+
+
 @app.get("/download_golden/{run_id}")
 def download_golden(run_id: str, background_tasks: BackgroundTasks):
     """
@@ -6242,6 +6518,9 @@ def download_golden(run_id: str, background_tasks: BackgroundTasks):
     log.info(f"/download_golden run_id={run_id}")
     
     run_dir = RUNS_ROOT / run_id
+    if get_annotation_mode(run_dir) == "behavior":
+        if sync_activity_visibility_from_masks(run_dir):
+            log.info(f"[DOWNLOAD_GOLDEN] Applied not_visible segments from golden masks run_id={run_id}")
     golden_root = run_dir / "golden"
     
     # Create a temporary zip file in scratch space

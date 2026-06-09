@@ -13,7 +13,6 @@ import {
   rebuildGoldenPreview,
   getBehavior,
 } from "../api.js";
-import BehaviorEditor from "../BehaviorEditor.jsx";
 import BehaviorLabelsReference from "../BehaviorLabelsReference.jsx";
 import BehaviorTimeline from "../BehaviorTimeline.jsx";
 import { ANNOTATION_MODES } from "../behaviorLabels.js";
@@ -99,7 +98,7 @@ function GoldenPreviewSyncStatus({ inSync, rebuilding }) {
 export default function MainWorkspacePage({ runId, frame0Image, annotationMode, onProgressUpdate }) {
   const isBehaviorMode = annotationMode === ANNOTATION_MODES.BEHAVIOR;
   const [activeTab, setActiveTab] = useState("tracking");
-  const [nFrames, setNFrames] = useState(50);
+  const [nFramesInput, setNFramesInput] = useState("50");
   const [autoResetInterval, setAutoResetInterval] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -167,10 +166,26 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
   };
 
   const handleTrack = async () => {
-    setBusy(true);
-    setIsTracking(true);
     setError("");
     setSuccess("");
+
+    const nFramesTrimmed = nFramesInput.trim();
+    if (nFramesTrimmed === "") {
+      setError("Please enter how many new frames to track.");
+      return;
+    }
+    const nFrames = parseInt(nFramesTrimmed, 10);
+    if (isNaN(nFrames) || nFrames < 1) {
+      setError("N new frames to track must be a positive number.");
+      return;
+    }
+    if (nFrames > 5000) {
+      setError("N new frames to track must be at most 5000.");
+      return;
+    }
+
+    setBusy(true);
+    setIsTracking(true);
     setTrackProgress(0);
     setTrackMessage("Preparing to track...");
 
@@ -407,8 +422,8 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
                     type="number"
                     min="1"
                     max="5000"
-                    value={nFrames}
-                    onChange={(e) => setNFrames(parseInt(e.target.value, 10) || 50)}
+                    value={nFramesInput}
+                    onChange={(e) => setNFramesInput(e.target.value)}
                     disabled={busy}
                     style={{
                       width: 120,
@@ -563,7 +578,9 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
                   maxFrame={progress.goldenMaxIdx}
                   currentFrame={goldenPlaybackFrame}
                   onSeekFrame={handleTimelineSeek}
+                  onLabelChanged={handleBehaviorLabelChanged}
                   refreshToken={behaviorTimelineRefresh}
+                  disabled={rebuildingPreview}
                 />
               )}
 
@@ -592,14 +609,6 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
                       ? "Golden preview is up to date"
                       : "Rebuild golden preview (apply labels to video)"}
                 </button>
-
-                <BehaviorEditor
-                  runId={runId}
-                  frame={goldenPlaybackFrame}
-                  maxFrame={progress.goldenMaxIdx}
-                  onLabelChanged={handleBehaviorLabelChanged}
-                  disabled={rebuildingPreview}
-                />
 
                 <BehaviorLabelsReference />
               </>

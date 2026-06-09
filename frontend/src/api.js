@@ -139,9 +139,7 @@ export async function getPrepareUploadProgress(runId) {
       console.warn(`[API] Progress request failed: ${res.status}`);
       return { status: "error", progress: 0, message: "Failed to get progress" };
     }
-    const data = await res.json();
-    console.log(`[API] Progress response:`, data);
-    return data;
+    return await res.json();
   } catch (e) {
     console.error(`[API] Progress request error:`, e);
     return { status: "error", progress: 0, message: e.message };
@@ -214,7 +212,6 @@ export async function prepareUploadVideo(file, onProgress = null) {
         if (!pollActive || !runId) return;
         try {
           const progress = await getPrepareUploadProgress(runId);
-          console.log("[API] Progress update:", progress);
           if (onProgress) {
             onProgress(progress.progress, progress.message, progress.stage);
           }
@@ -241,8 +238,8 @@ export async function prepareUploadVideo(file, onProgress = null) {
       // Poll immediately
       pollOnce();
       
-      // Then poll every 200ms
-      pollInterval = setInterval(pollOnce, 200);
+      // Poll every second (enough for progress UI; avoids log noise)
+      pollInterval = setInterval(pollOnce, 1000);
       
       // Clear interval after 3 minutes max
       setTimeout(() => {
@@ -261,7 +258,7 @@ export async function prepareUploadVideo(file, onProgress = null) {
       // Wait for extraction to complete (poll until we get final metadata)
       let attempts = 0;
       while (attempts < 300 && (!result.fps || !result.n_frames_total)) {  // Max 60 seconds
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 1000));
         try {
           const progress = await getPrepareUploadProgress(runId);
           if (progress.status === "completed" && progress.fps !== undefined) {
@@ -404,6 +401,19 @@ export async function setBehaviorLabel(runId, cowId, frame, labelId, dimension =
   return res.json();
 }
 
+export async function deleteBehaviorLabel(runId, cowId, frame, dimension = "activity") {
+  const res = await fetch(`${BACKEND}/behavior/${runId}/delete_label`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cow_id: cowId, frame, dimension }),
+  });
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`HTTP ${res.status}: ${error}`);
+  }
+  return res.json();
+}
+
 export async function rebuildGoldenPreview(runId) {
   const res = await fetch(`${BACKEND}/golden/${runId}/rebuild_preview`, {
     method: "POST",
@@ -454,8 +464,7 @@ export async function trackFrames(runId, nFrames, autoResetInterval = null, onPr
         if (!pollActive || !runId) return;
         try {
           const progress = await getTrackProgress(runId);
-          console.log("[API] Track progress update:", progress);
-          
+
           // Update UI if tracking has started or is in progress
           if (progress.status === "in_progress" || progress.status === "completed") {
             if (onProgress) {
