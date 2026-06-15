@@ -1,14 +1,25 @@
 import { BACKEND } from "./backendConfig.js";
 
+/** Skip Pinggy free-tier browser warning (required for fetch from localhost). */
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("X-Pinggy-No-Screen")) {
+    headers.set("X-Pinggy-No-Screen", "true");
+  }
+  return fetch(url, { ...options, headers });
+}
+
 /**
  * Test backend connection
  */
 export async function testConnection() {
   try {
-    const res = await fetch(`${BACKEND}/health`, {
+    const res = await apiFetch(`${BACKEND}/health`, {
       method: "GET",
     });
-    return res.ok;
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data?.status === "ok";
   } catch (e) {
     console.error("[API] Connection test failed:", e);
     return false;
@@ -30,7 +41,7 @@ export async function initVideo(videoPath, prompt = "cow") {
   
   try {
     console.log(`[API] Fetching ${BACKEND}/init?${params.toString()}`);
-    const res = await fetch(`${BACKEND}/init?${params}`, {
+    const res = await apiFetch(`${BACKEND}/init?${params}`, {
       method: "POST",
       signal: controller.signal,
       headers: {
@@ -105,7 +116,7 @@ export async function prepareVideo(videoPath) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 min
   try {
-    const res = await fetch(`${BACKEND}/prepare?${params}`, {
+    const res = await apiFetch(`${BACKEND}/prepare?${params}`, {
       method: "POST",
       signal: controller.signal,
       headers: { "Accept": "application/json" },
@@ -135,7 +146,7 @@ export async function prepareVideo(videoPath) {
  */
 export async function getPrepareUploadProgress(runId) {
   try {
-    const res = await fetch(`${BACKEND}/prepare_upload_progress/${runId}`);
+    const res = await apiFetch(`${BACKEND}/prepare_upload_progress/${runId}`);
     if (!res.ok) {
       console.warn(`[API] Progress request failed: ${res.status}`);
       return { status: "error", progress: 0, message: "Failed to get progress" };
@@ -176,7 +187,7 @@ export async function prepareUploadVideo(file, onProgress = null) {
   
   try {
     console.log("[API] Starting upload request...");
-    const res = await fetch(`${BACKEND}/prepare_upload`, {
+    const res = await apiFetch(`${BACKEND}/prepare_upload`, {
       method: "POST",
       body: form,
       signal: controller.signal,
@@ -304,7 +315,7 @@ export async function initSam(runId, prompt = "cow") {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 min
   try {
-    const res = await fetch(`${BACKEND}/init_sam/${runId}?${params}`, {
+    const res = await apiFetch(`${BACKEND}/init_sam/${runId}?${params}`, {
       method: "POST",
       signal: controller.signal,
       headers: { "Accept": "application/json" },
@@ -354,7 +365,7 @@ export async function applyInitIds(
   if (behaviorLabel3ByCowId && Object.keys(behaviorLabel3ByCowId).length > 0) {
     body.behavior_label3_by_cow_id = behaviorLabel3ByCowId;
   }
-  const res = await fetch(`${BACKEND}/apply_init_ids/${runId}`, {
+  const res = await apiFetch(`${BACKEND}/apply_init_ids/${runId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -367,7 +378,7 @@ export async function applyInitIds(
 }
 
 export async function setAnnotationMode(runId, mode) {
-  const res = await fetch(`${BACKEND}/run/${runId}/annotation_mode`, {
+  const res = await apiFetch(`${BACKEND}/run/${runId}/annotation_mode`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mode }),
@@ -381,7 +392,7 @@ export async function setAnnotationMode(runId, mode) {
 
 export async function getBehavior(runId, frame = null) {
   const params = frame !== null ? `?frame=${frame}` : "";
-  const res = await fetch(`${BACKEND}/behavior/${runId}${params}`);
+  const res = await apiFetch(`${BACKEND}/behavior/${runId}${params}`);
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`HTTP ${res.status}: ${error}`);
@@ -390,7 +401,7 @@ export async function getBehavior(runId, frame = null) {
 }
 
 export async function setBehaviorLabel(runId, cowId, frame, labelId, dimension = "activity") {
-  const res = await fetch(`${BACKEND}/behavior/${runId}/set_label`, {
+  const res = await apiFetch(`${BACKEND}/behavior/${runId}/set_label`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ cow_id: cowId, frame, label_id: labelId, dimension }),
@@ -403,7 +414,7 @@ export async function setBehaviorLabel(runId, cowId, frame, labelId, dimension =
 }
 
 export async function deleteBehaviorLabel(runId, cowId, frame, dimension = "activity") {
-  const res = await fetch(`${BACKEND}/behavior/${runId}/delete_label`, {
+  const res = await apiFetch(`${BACKEND}/behavior/${runId}/delete_label`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ cow_id: cowId, frame, dimension }),
@@ -416,7 +427,7 @@ export async function deleteBehaviorLabel(runId, cowId, frame, dimension = "acti
 }
 
 export async function rebuildGoldenPreview(runId) {
-  const res = await fetch(`${BACKEND}/golden/${runId}/rebuild_preview`, {
+  const res = await apiFetch(`${BACKEND}/golden/${runId}/rebuild_preview`, {
     method: "POST",
   });
   if (!res.ok) {
@@ -451,7 +462,7 @@ export async function trackFrames(runId, nFrames, autoResetInterval = null, onPr
 
   try {
     // Start the fetch request first
-    const fetchPromise = fetch(`${BACKEND}/track?${params}`, {
+    const fetchPromise = apiFetch(`${BACKEND}/track?${params}`, {
       method: "POST",
       signal: controller.signal,
     });
@@ -549,7 +560,7 @@ export async function trackFrames(runId, nFrames, autoResetInterval = null, onPr
  */
 export async function commitFrames(runId) {
   const params = new URLSearchParams({ run_id: runId });
-  const res = await fetch(`${BACKEND}/commit?${params}`, {
+  const res = await apiFetch(`${BACKEND}/commit?${params}`, {
     method: "POST",
   });
   if (!res.ok) {
@@ -566,7 +577,7 @@ export async function commitFrames(runId) {
  */
 export async function getTrackProgress(runId) {
   try {
-    const res = await fetch(`${BACKEND}/track_progress/${runId}`);
+    const res = await apiFetch(`${BACKEND}/track_progress/${runId}`);
     if (!res.ok) {
       return { status: "error", progress: 0, message: "Failed to get progress" };
     }
@@ -582,7 +593,7 @@ export async function getTrackProgress(runId) {
  * @returns {Promise<{golden_processed: number, golden_percent: number, ...}>}
  */
 export async function getProgress(runId) {
-  const res = await fetch(`${BACKEND}/progress/${runId}`);
+  const res = await apiFetch(`${BACKEND}/progress/${runId}`);
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`HTTP ${res.status}: ${error}`);
@@ -636,7 +647,7 @@ export async function downloadGolden(runId) {
  * @returns {Promise<Blob>} - Image blob
  */
 export async function getTrackedFrame(runId, relativeFrameIdx) {
-  const res = await fetch(`${BACKEND}/tracked_frame/${runId}/${relativeFrameIdx}`);
+  const res = await apiFetch(`${BACKEND}/tracked_frame/${runId}/${relativeFrameIdx}`);
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`HTTP ${res.status}: ${error}`);
@@ -651,7 +662,7 @@ export async function getTrackedFrame(runId, relativeFrameIdx) {
  * @returns {Promise<{image: string, mask_assignments: Array, existing_ids: Array}>}
  */
 export async function prepareCorrection(runId, frameIdx) {
-  const res = await fetch(`${BACKEND}/prepare_correction/${runId}/${frameIdx}`, {
+  const res = await apiFetch(`${BACKEND}/prepare_correction/${runId}/${frameIdx}`, {
     method: "POST",
   });
   if (!res.ok) {
@@ -669,7 +680,7 @@ export async function prepareCorrection(runId, frameIdx) {
  * @returns {Promise<{image: string}>}
  */
 export async function previewCorrectionUpdate(runId, frameIdx, mapping) {
-  const res = await fetch(`${BACKEND}/preview_correction_update/${runId}/${frameIdx}`, {
+  const res = await apiFetch(`${BACKEND}/preview_correction_update/${runId}/${frameIdx}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mapping }),
@@ -689,7 +700,7 @@ export async function previewCorrectionUpdate(runId, frameIdx, mapping) {
  * @returns {Promise<{status: string, max_id: number}>}
  */
 export async function applyCorrection(runId, frameIdx, mapping) {
-  const res = await fetch(`${BACKEND}/apply_correction/${runId}/${frameIdx}`, {
+  const res = await apiFetch(`${BACKEND}/apply_correction/${runId}/${frameIdx}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mapping }),
@@ -710,7 +721,7 @@ export async function applyCorrection(runId, frameIdx, mapping) {
  * @returns {Promise<{image: string, mask_index: number, refined_mask_size: number, image_width: number, image_height: number}>}
  */
 export async function refineMask(runId, frameIdx, maskIndex, points) {
-  const res = await fetch(`${BACKEND}/refine_mask/${runId}/${frameIdx}`, {
+  const res = await apiFetch(`${BACKEND}/refine_mask/${runId}/${frameIdx}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -739,7 +750,7 @@ export async function refineMask(runId, frameIdx, maskIndex, points) {
  * @returns {Promise<{image: string, new_mask_index: number, new_mask_size: number, total_masks: number, image_width: number, image_height: number}>}
  */
 export async function addMask(runId, frameIdx, x, y, isPositive) {
-  const res = await fetch(`${BACKEND}/add_mask/${runId}/${frameIdx}`, {
+  const res = await apiFetch(`${BACKEND}/add_mask/${runId}/${frameIdx}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ point: { x, y, is_positive: isPositive } }),
@@ -761,7 +772,7 @@ export async function matchInitIds(runId, maskFile) {
   const formData = new FormData();
   formData.append('file', maskFile);
   
-  const res = await fetch(`${BACKEND}/match_init_ids/${runId}`, {
+  const res = await apiFetch(`${BACKEND}/match_init_ids/${runId}`, {
     method: "POST",
     body: formData,
   });
@@ -779,7 +790,7 @@ export async function matchInitIds(runId, maskFile) {
  * @returns {Promise<{image: string}>}
  */
 export async function previewInitUpdate(runId, mapping) {
-  const res = await fetch(`${BACKEND}/preview_init_update/${runId}`, {
+  const res = await apiFetch(`${BACKEND}/preview_init_update/${runId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mapping }),
