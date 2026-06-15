@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import VideoPlayer from "../VideoPlayer.jsx";
 import { prepareUploadVideo, getProgress, getSourceVideoUrl, initSam, setAnnotationMode } from "../api.js";
 import { ANNOTATION_MODES } from "../behaviorLabels.js";
+import { BACKEND } from "../backendConfig.js";
 
 export default function VideoSelectionPage({
   onVideoLoaded,
@@ -201,7 +202,11 @@ export default function VideoSelectionPage({
               lineHeight: 1.5,
             }}
           >
-            Backend is not reachable. Check that the server is running and your SSH port forwarding is active.
+            Backend is not reachable at <code>{BACKEND}</code>. If using localhost.run, the tunnel
+            may have expired — on the desktop restart{" "}
+            <code>ssh -R 80:127.0.0.1:12212 nokey@localhost.run</code>, copy the new{" "}
+            <code>https://….lhr.life</code> URL into <code>frontend/.env</code>, restart{" "}
+            <code>npm run dev</code>, then refresh.
           </div>
         )}
 

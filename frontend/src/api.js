@@ -1,4 +1,4 @@
-const BACKEND = "http://127.0.0.1:12212";
+import { BACKEND } from "./backendConfig.js";
 
 /**
  * Test backend connection
@@ -83,9 +83,10 @@ export async function initVideo(videoPath, prompt = "cow") {
       }
       throw new Error(
         `Network error: Could not connect to backend at ${BACKEND}. ` +
-        `Make sure: 1) The server is running, 2) SSH port forwarding is active ` +
-        `(ssh -N -L 12212:r02g03.bullx:12212 gregormi@puhti.csc.fi), ` +
-        `3) CORS is enabled. Original error: ${e.message}`
+        `Make sure: 1) The server is running, 2) frontend/.env VITE_API_URL points to the right host ` +
+        `(LAN desktop e.g. http://192.168.1.46:12212, or localhost for same machine / SSH tunnel ` +
+        `ssh -N -L 12212:r02g03.bullx:12212 gregormi@puhti.csc.fi), 3) CORS is enabled. ` +
+        `Original error: ${e.message}`
       );
     }
     throw e;
