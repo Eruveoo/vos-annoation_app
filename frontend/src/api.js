@@ -1,10 +1,14 @@
-import { BACKEND } from "./backendConfig.js";
+import { BACKEND, getBasicAuthHeader, withBackendAuth } from "./backendConfig.js";
 
 /** Skip Pinggy free-tier browser warning (required for fetch from localhost). */
 function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (!headers.has("X-Pinggy-No-Screen")) {
     headers.set("X-Pinggy-No-Screen", "true");
+  }
+  const auth = getBasicAuthHeader();
+  if (auth && !headers.has("Authorization")) {
+    headers.set("Authorization", auth);
   }
   return fetch(url, { ...options, headers });
 }
@@ -17,7 +21,10 @@ export async function testConnection() {
     const res = await apiFetch(`${BACKEND}/health`, {
       method: "GET",
     });
-    if (!res.ok) return false;
+    if (!res.ok) {
+      console.error(`[API] Connection test failed: HTTP ${res.status}`);
+      return false;
+    }
     const data = await res.json();
     return data?.status === "ok";
   } catch (e) {
@@ -339,7 +346,7 @@ export async function initSam(runId, prompt = "cow") {
 }
 
 export function getSourceVideoUrl(runId) {
-  return `${BACKEND}/source/${runId}`;
+  return withBackendAuth(`${BACKEND}/source/${runId}`);
 }
 
 /**
@@ -605,14 +612,14 @@ export async function getProgress(runId) {
  * Get video URL for tracked result
  */
 export function getTrackedVideoUrl(runId) {
-  return `${BACKEND}/result/${runId}`;
+  return withBackendAuth(`${BACKEND}/result/${runId}`);
 }
 
 /**
  * Get video URL for golden preview
  */
 export function getGoldenVideoUrl(runId) {
-  return `${BACKEND}/golden_video/${runId}`;
+  return withBackendAuth(`${BACKEND}/golden_video/${runId}`);
 }
 
 /**
@@ -620,7 +627,7 @@ export function getGoldenVideoUrl(runId) {
  * @param {string} runId - The run ID
  */
 export async function downloadGolden(runId) {
-  const url = `${BACKEND}/download_golden/${runId}`;
+  const url = withBackendAuth(`${BACKEND}/download_golden/${runId}`);
   
   try {
     // Important: the golden zip can be very large (hundreds of MB).

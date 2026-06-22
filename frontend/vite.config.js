@@ -1,19 +1,43 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 5173,
-    // Optional: proxy API through Vite dev server (avoids CORS). Not used by default —
-    // api.js calls VITE_API_URL directly. To enable, set VITE_API_URL=/api in .env and
-    // uncomment proxy below (target = your backend host).
-    // proxy: {
-    //   "/api": {
-    //     target: "http://192.168.1.46:12212",
-    //     changeOrigin: true,
-    //     rewrite: (path) => path.replace(/^\/api/, ""),
-    //   },
-    // },
-  },
+function buildRemoteProxy(env) {
+  const target = (env.VITE_API_URL || "").trim().replace(/\/$/, "");
+  if (!target || !/^https?:\/\//.test(target)) return undefined;
+
+  const user = (env.VITE_API_USER || "").trim();
+  const password = (env.VITE_API_PASSWORD || "").trim();
+
+  return {
+    "/api": {
+      target,
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/api/, ""),
+      configure: (proxy) => {
+        proxy.on("proxyReq", (proxyReq) => {
+          proxyReq.setHeader("X-Pinggy-No-Screen", "true");
+          if (user && password) {
+            const token = Buffer.from(`${user}:${password}`).toString("base64");
+            proxyReq.setHeader("Authorization", `Basic ${token}`);
+          }
+        });
+      },
+    },
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  const proxy = buildRemoteProxy(env);
+
+  return {
+    plugins: [react()],
+    server: {
+      port: 5173,
+      proxy,
+    },
+    preview: {
+      proxy,
+    },
+  };
 });
