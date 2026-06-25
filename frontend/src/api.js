@@ -623,13 +623,6 @@ export function getGoldenVideoUrl(runId) {
 }
 
 /**
- * Get video URL for golden preview (masks + IDs only, no behaviour labels)
- */
-export function getGoldenMasksVideoUrl(runId) {
-  return withBackendAuth(`${BACKEND}/golden_masks_video/${runId}`);
-}
-
-/**
  * Download the golden folder as a zip file
  * @param {string} runId - The run ID
  */

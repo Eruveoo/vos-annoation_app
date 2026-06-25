@@ -1055,53 +1055,8 @@ def draw_cow_overlay_with_behavior(
     return frame
 
 
-GOLDEN_PREVIEW_WITH_LABELS = "golden_preview.mp4"
-GOLDEN_PREVIEW_MASKS_ONLY = "golden_preview_masks.mp4"
-
-
-def golden_preview_video_path(run_dir: Path, masks_only: bool = False) -> Path:
-    name = GOLDEN_PREVIEW_MASKS_ONLY if masks_only else GOLDEN_PREVIEW_WITH_LABELS
-    return run_dir / "golden" / name
-
-
-def _finalize_golden_preview_segment(seg_path: Path, fps: float) -> None:
-    if not seg_path.exists():
-        return
-    seg_reencoded = seg_path.parent / f"{seg_path.stem}_reencoded.mp4"
-    if _ffmpeg_reencode_video(seg_path, seg_reencoded, fps):
-        seg_reencoded.replace(seg_path)
-
-
-def _append_to_golden_preview_file(preview_path: Path, segment_path: Path, fps: float) -> None:
-    if not segment_path.exists():
-        return
-    ensure_dir(preview_path.parent)
-    if preview_path.exists():
-        _ffmpeg_concat(preview_path, segment_path, preview_path, fps)
-    else:
-        preview_path.write_bytes(segment_path.read_bytes())
-
-
-def append_masks_only_golden_segment(
-    run_dir: Path, fps: float, n_ids: int, start_idx: int, end_idx: int
-) -> None:
-    """Render mask + ID overlay (no behaviour labels) and append to golden_preview_masks.mp4."""
-    if get_annotation_mode(run_dir) != "behavior":
-        return
-    start_idx, end_idx = int(start_idx), int(end_idx)
-    if end_idx < start_idx:
-        return
-    seg_path = run_dir / "golden_segments" / f"{start_idx:05d}_{end_idx:05d}_masks.mp4"
-    ensure_dir(seg_path.parent)
-    _render_segment_from_golden(
-        run_dir, fps, n_ids, start_idx, end_idx, seg_path, include_behavior=False
-    )
-    _finalize_golden_preview_segment(seg_path, fps)
-    _append_to_golden_preview_file(golden_preview_video_path(run_dir, masks_only=True), seg_path, fps)
-
-
 def rebuild_golden_preview_video(run_dir: Path) -> bool:
-    """Re-render golden preview video(s) from committed golden frames."""
+    """Re-render golden_preview.mp4 from committed golden frames (includes behaviour overlays)."""
     meta_path = run_dir / "meta.txt"
     if not meta_path.exists():
         return False
@@ -1116,38 +1071,25 @@ def rebuild_golden_preview_video(run_dir: Path) -> bool:
     if max_idx is None:
         return False
 
-    behavior_mode = get_annotation_mode(run_dir) == "behavior"
-    targets = [(True, GOLDEN_PREVIEW_WITH_LABELS)]
-    if behavior_mode:
-        targets.append((False, GOLDEN_PREVIEW_MASKS_ONLY))
+    golden_preview = run_dir / "golden" / "golden_preview.mp4"
+    tmp_out = run_dir / "golden" / "golden_preview_rebuild_tmp.mp4"
+    ensure_dir(golden_preview.parent)
 
-    ok_any = False
-    for include_behavior, filename in targets:
-        golden_preview = run_dir / "golden" / filename
-        tmp_out = run_dir / "golden" / f"{filename}_rebuild_tmp.mp4"
-        ensure_dir(golden_preview.parent)
+    log.info(f"[GOLDEN_PREVIEW] Rebuilding 0..{max_idx} for run {run_dir.name}")
+    _render_segment_from_golden(run_dir, fps, n_ids, 0, int(max_idx), tmp_out)
+    if not tmp_out.exists() or tmp_out.stat().st_size == 0:
+        log.error("[GOLDEN_PREVIEW] Rebuild produced empty output")
+        return False
 
-        log.info(
-            f"[GOLDEN_PREVIEW] Rebuilding {filename} 0..{max_idx} "
-            f"(behavior_labels={include_behavior}) for run {run_dir.name}"
-        )
-        _render_segment_from_golden(
-            run_dir, fps, n_ids, 0, int(max_idx), tmp_out, include_behavior=include_behavior
-        )
-        if not tmp_out.exists() or tmp_out.stat().st_size == 0:
-            log.error(f"[GOLDEN_PREVIEW] Rebuild produced empty output for {filename}")
-            continue
-
-        golden_preview_tmp = run_dir / "golden" / f"{filename}_tmp.mp4"
-        if _ffmpeg_reencode_video(tmp_out, golden_preview_tmp, fps):
-            golden_preview_tmp.replace(golden_preview)
-        else:
-            tmp_out.replace(golden_preview)
-        if tmp_out.exists():
-            tmp_out.unlink()
-        log.info(f"[GOLDEN_PREVIEW] Rebuild complete: {golden_preview}")
-        ok_any = True
-    return ok_any
+    golden_preview_tmp = run_dir / "golden" / "golden_preview_tmp.mp4"
+    if _ffmpeg_reencode_video(tmp_out, golden_preview_tmp, fps):
+        golden_preview_tmp.replace(golden_preview)
+    else:
+        tmp_out.replace(golden_preview)
+    if tmp_out.exists():
+        tmp_out.unlink()
+    log.info(f"[GOLDEN_PREVIEW] Rebuild complete: {golden_preview}")
+    return True
 
 
 def masks_to_label_map(masks_bool):
@@ -3252,9 +3194,6 @@ def apply_init_ids(run_id: str, payload: ApplyInitPayload):
     if _ffmpeg_reencode_video(golden_preview_init, golden_preview_tmp, fps):
         golden_preview_tmp.replace(golden_preview_init)
 
-    if get_annotation_mode(run_dir) == "behavior":
-        append_masks_only_golden_segment(run_dir, fps, n_ids, 0, 0)
-    
     # Clean up temporary masks file
     masks_file.unlink()
 
@@ -4139,10 +4078,6 @@ def commit(run_id: str):
                         _ffmpeg_concat(golden_preview, tracked_seg_path, golden_preview, fps)
                     else:
                         golden_preview.write_bytes(tracked_seg_path.read_bytes())
-                    if get_annotation_mode(run_dir) == "behavior":
-                        append_masks_only_golden_segment(
-                            run_dir, fps, n_ids, seed_idx + 1, last_corrected_frame - 1
-                        )
                 else:
                     log.error(f"[COMMIT] Failed to extract tracked segment: {p.stdout[-500:] if p.stdout else 'no output'}")
             
@@ -4162,10 +4097,6 @@ def commit(run_id: str):
                     _ffmpeg_concat(golden_preview, corrected_seg_path, golden_preview, fps)
                 else:
                     golden_preview.write_bytes(corrected_seg_path.read_bytes())
-                if get_annotation_mode(run_dir) == "behavior":
-                    append_masks_only_golden_segment(
-                        run_dir, fps, n_ids, last_corrected_frame, last_corrected_frame
-                    )
                 log.debug(f"[COMMIT] Golden preview updated: tracked frames {seed_idx+1}..{last_corrected_frame-1} + corrected frame {last_corrected_frame}")
                 log.debug(f"[COMMIT] Frames {last_corrected_frame+1}..{int(chunk_kv.get('end_idx', end_idx))} were discarded (will be re-tracked from frame {last_corrected_frame})")
         else:
@@ -4193,8 +4124,6 @@ def commit(run_id: str):
                         log.debug(f"[COMMIT] Successfully appended chunk_new to golden_preview.mp4")
                     else:
                         log.error("[COMMIT] ❌ Concat failed (non-fatal).")
-                    if get_annotation_mode(run_dir) == "behavior":
-                        append_masks_only_golden_segment(run_dir, fps, n_ids, seed_idx + 1, end_idx)
                 else:
                     log.info("[COMMIT] golden_preview.mp4 does not exist, initializing from chunk_new.mp4...")
                     golden_preview.parent.mkdir(parents=True, exist_ok=True)
@@ -4202,8 +4131,6 @@ def commit(run_id: str):
                     init_size = golden_preview.stat().st_size
                     init_dur = _probe_duration(golden_preview)
                     log.debug(f"[COMMIT] Initialized golden_preview.mp4 from chunk_new.mp4: size={init_size} bytes, duration={init_dur}s")
-                    if get_annotation_mode(run_dir) == "behavior":
-                        append_masks_only_golden_segment(run_dir, fps, n_ids, seed_idx + 1, end_idx)
             else:
                 log.warning(f"[COMMIT] ❌ chunk_new.mp4 missing at {chunk_new}; falling back to rendering from golden")
                 seg_path = run_dir / "golden_segments" / f"{seed_idx+1:05d}_{end_idx:05d}.mp4"
@@ -4220,8 +4147,6 @@ def commit(run_id: str):
                         _ffmpeg_concat(golden_preview, seg_path, golden_preview, fps)
                     else:
                         golden_preview.write_bytes(seg_path.read_bytes())
-                    if get_annotation_mode(run_dir) == "behavior":
-                        append_masks_only_golden_segment(run_dir, fps, n_ids, seed_idx + 1, end_idx)
                     log.debug(f"[COMMIT] Golden preview updated from rendered segment")
     except Exception as e:
         log.error(f"[COMMIT] ❌ Golden preview update failed (non-fatal): {e}", exc_info=True)
@@ -4972,10 +4897,6 @@ def prepare_correction(run_id: str, frame_idx: int):
                             golden_preview.write_bytes(seg_path.read_bytes())
                             golden_preview_size = golden_preview.stat().st_size
                             log.info(f"[PREPARE_CORRECTION] ✅ Initialized golden preview video: {max_idx+1}..{commit_up_to} (size={golden_preview_size} bytes)")
-                        if get_annotation_mode(run_dir) == "behavior":
-                            append_masks_only_golden_segment(
-                                run_dir, fps, n_ids, max_idx + 1, commit_up_to
-                            )
                     else:
                         log.error(f"[PREPARE_CORRECTION] ❌ Failed to extract tracked segment (returncode={p.returncode}): {p.stdout[-500:] if p.stdout else 'no output'}")
                 else:
@@ -6261,8 +6182,6 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
                 log.info(f"[APPLY_CORRECTION] Golden preview doesn't exist, initializing from segment")
                 golden_preview.write_bytes(seg_path.read_bytes())
                 log.info(f"[APPLY_CORRECTION] Golden preview initialized")
-            if get_annotation_mode(run_dir) == "behavior":
-                append_masks_only_golden_segment(run_dir, fps, new_max_id, frame_idx, frame_idx)
         else:
             log.error(f"[APPLY_CORRECTION] Segment was not created: {seg_path}")
     except Exception as e:
@@ -6410,10 +6329,6 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
                         _ffmpeg_concat(golden_preview, seg_path, golden_preview, fps)
                     else:
                         golden_preview.write_bytes(seg_path.read_bytes())
-                    if get_annotation_mode(run_dir) == "behavior":
-                        append_masks_only_golden_segment(
-                            run_dir, fps, n_ids, seed_idx + 1, commit_up_to
-                        )
                     log.info(f"Updated golden preview video with committed frames {seed_idx+1}..{commit_up_to}")
         except Exception as e:
             log.warning(f"Failed to update golden preview video (non-fatal): {e}")
@@ -6483,10 +6398,6 @@ def correct_frame(run_id: str, wrong_frame_idx: int):
                 _ffmpeg_concat(golden_preview, seg_path, golden_preview, fps)
             else:
                 golden_preview.write_bytes(seg_path.read_bytes())
-            if get_annotation_mode(run_dir) == "behavior":
-                append_masks_only_golden_segment(
-                    run_dir, fps, new_max_id, wrong_frame_idx, wrong_frame_idx
-                )
             log.info(f"Updated golden preview video with corrected frame {wrong_frame_idx}")
     except Exception as e:
         log.warning(f"Failed to update golden preview video with corrected frame (non-fatal): {e}")
@@ -6558,20 +6469,6 @@ def golden_video(run_id: str):
     path = RUNS_ROOT / run_id / "golden" / "golden_preview.mp4"
     if not path.exists():
         raise HTTPException(404, "No golden preview yet.")
-
-    return FileResponse(
-        path,
-        media_type="video/mp4",
-        headers={"Cache-Control": "no-store, max-age=0"},
-    )
-
-
-@app.get("/golden_masks_video/{run_id}")
-def golden_masks_video(run_id: str):
-    """Golden preview with mask overlays only (no behaviour labels)."""
-    path = RUNS_ROOT / run_id / "golden" / GOLDEN_PREVIEW_MASKS_ONLY
-    if not path.exists():
-        raise HTTPException(404, "No masks-only golden preview yet.")
 
     return FileResponse(
         path,

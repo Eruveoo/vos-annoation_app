@@ -9,7 +9,7 @@ import {
   getProgress,
   getTrackedVideoUrl,
   getGoldenVideoUrl,
-  getGoldenMasksVideoUrl,
+  getSourceVideoUrl,
   downloadGolden,
   rebuildGoldenPreview,
   getBehavior,
@@ -106,13 +106,13 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
   const [success, setSuccess] = useState("");
   const [trackedVideoUrl, setTrackedVideoUrl] = useState(null);
   const [goldenVideoUrl, setGoldenVideoUrl] = useState(null);
-  const [goldenMasksVideoUrl, setGoldenMasksVideoUrl] = useState(null);
+  const [sourceVideoUrl, setSourceVideoUrl] = useState(null);
   const [goldenPlaybackFrame, setGoldenPlaybackFrame] = useState(0);
   const [goldenPreviewInSync, setGoldenPreviewInSync] = useState(true);
   const [rebuildingPreview, setRebuildingPreview] = useState(false);
   const [behaviorTimelineRefresh, setBehaviorTimelineRefresh] = useState(0);
   const goldenVideoRef = React.useRef(null);
-  const goldenMasksVideoRef = React.useRef(null);
+  const sourceVideoRef = React.useRef(null);
   const [trackProgress, setTrackProgress] = useState(0);
   const [trackMessage, setTrackMessage] = useState("");
   const [isTracking, setIsTracking] = useState(false);
@@ -143,6 +143,12 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
   }, [runId]);
 
   React.useEffect(() => {
+    if (runId && isBehaviorMode) {
+      setSourceVideoUrl(getSourceVideoUrl(runId));
+    }
+  }, [runId, isBehaviorMode]);
+
+  React.useEffect(() => {
     loadBehaviorSyncStatus();
   }, [loadBehaviorSyncStatus, isBehaviorMode]);
 
@@ -158,11 +164,7 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
         goldenMaxIdx: prog.golden_max_idx !== null && prog.golden_max_idx !== undefined ? prog.golden_max_idx : null,
       });
       if (prog.golden_processed > 0) {
-        const cacheBust = `?t=${Date.now()}`;
-        setGoldenVideoUrl(getGoldenVideoUrl(runId) + cacheBust);
-        if (isBehaviorMode) {
-          setGoldenMasksVideoUrl(getGoldenMasksVideoUrl(runId) + cacheBust);
-        }
+        setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
       }
       if (onProgressUpdate) {
         onProgressUpdate(prog);
@@ -253,11 +255,7 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
 
   const refreshGoldenVideo = () => {
     if (runId) {
-      const cacheBust = `?t=${Date.now()}`;
-      setGoldenVideoUrl(getGoldenVideoUrl(runId) + cacheBust);
-      if (isBehaviorMode) {
-        setGoldenMasksVideoUrl(getGoldenMasksVideoUrl(runId) + cacheBust);
-      }
+      setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
     }
   };
 
@@ -271,7 +269,7 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
   const handleTimelineSeek = (frame) => {
     setGoldenPlaybackFrame(frame);
     goldenVideoRef.current?.seekToFrame(frame);
-    goldenMasksVideoRef.current?.seekToFrame(frame);
+    sourceVideoRef.current?.seekToFrame(frame);
   };
 
   const handleRebuildGoldenPreview = async () => {
@@ -574,12 +572,12 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
               </div>
             )}
 
-            {isBehaviorMode && goldenMasksVideoUrl && (
+            {isBehaviorMode && sourceVideoUrl && (
               <div style={{ marginBottom: 24 }}>
                 <VideoPlayer
-                  ref={goldenMasksVideoRef}
-                  videoUrl={goldenMasksVideoUrl}
-                  label="Golden video — masks only (no behaviour labels)"
+                  ref={sourceVideoRef}
+                  videoUrl={sourceVideoUrl}
+                  label="Source video (no masks or labels)"
                   height={480}
                   fps={progress.fps}
                   onPlaybackFrame={setGoldenPlaybackFrame}
