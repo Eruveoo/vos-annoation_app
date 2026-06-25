@@ -667,6 +667,83 @@ def create_initial_segments(
     return empty_behavior_data(cow_ids, dimension) | {"segments": segments}
 
 
+def _pre_detection_label_for_dimension(dimension: str) -> str:
+    """Label for frames before a cow first appears in masks (late add_mask / correction)."""
+    if dimension == "activity":
+        return NOT_VISIBLE_LABEL_ID
+    if dimension == "label2":
+        return NOT_SEEN_LABEL_ID
+    return BEHAVIOR_LABEL_NONE
+
+
+def register_late_behavior_cows(
+    run_dir: Path, cow_ids: List[int], first_visible_frame: int
+) -> List[int]:
+    """
+    Register cows that first appear after frame 0 (e.g. add_mask + apply_correction).
+    Adds segments from frame 0 through first_visible_frame - 1 with a pre-detection label,
+    then an open-ended segment from first_visible_frame with the dimension default.
+    """
+    if get_annotation_mode(run_dir) != "behavior":
+        return []
+
+    new_cow_ids = sorted({int(c) for c in cow_ids if int(c) > 0})
+    if not new_cow_ids:
+        return []
+
+    first_visible_frame = int(first_visible_frame)
+    registered: List[int] = []
+
+    for dimension in BEHAVIOR_DIMENSIONS:
+        data = load_behavior_dimension(run_dir, dimension)
+        if data is None:
+            data = empty_behavior_data([], dimension)
+
+        existing = {int(c) for c in data.get("cow_ids", [])}
+        to_add = [cid for cid in new_cow_ids if cid not in existing]
+        if not to_add:
+            continue
+
+        segments: List[Dict[str, Any]] = list(data.get("segments", []))
+        pre_label = _pre_detection_label_for_dimension(dimension)
+        default_label = _default_label_for_dimension(dimension)
+
+        for cow_id in to_add:
+            if first_visible_frame > 0:
+                segments.append(
+                    {
+                        "cow_id": cow_id,
+                        "start_frame": 0,
+                        "end_frame": first_visible_frame - 1,
+                        "label_id": pre_label,
+                        "visible": _segment_visible(pre_label, dimension),
+                    }
+                )
+            segments.append(
+                {
+                    "cow_id": cow_id,
+                    "start_frame": first_visible_frame,
+                    "end_frame": None,
+                    "label_id": default_label,
+                    "visible": _segment_visible(default_label, dimension),
+                }
+            )
+            registered.append(cow_id)
+
+        data["cow_ids"] = sorted(existing | set(to_add))
+        data["segments"] = _normalize_behavior_segments(segments)
+        save_behavior_dimension(run_dir, dimension, data)
+
+    registered_unique = sorted(set(registered))
+    if registered_unique:
+        mark_behavior_preview_out_of_sync(run_dir)
+        log.info(
+            f"[BEHAVIOR] Registered late cows {registered_unique} "
+            f"first_visible_frame={first_visible_frame} run_dir={run_dir.name}"
+        )
+    return registered_unique
+
+
 def _find_covering_behavior_segment(
     segments: List[Dict[str, Any]], cow_id: int, frame: int
 ) -> Optional[Dict[str, Any]]:
@@ -6043,6 +6120,18 @@ def apply_correction(run_id: str, frame_idx: int, id_mapping: IDMapping):
     log.info(f"[APPLY_CORRECTION] Verified saved mask: max_id={verify_max_id}, IDs={verify_ids}")
     if not np.array_equal(label_map, verify_mask):
         log.error(f"[APPLY_CORRECTION] ⚠️  WARNING: Saved mask doesn't match what we tried to save!")
+
+    if get_annotation_mode(run_dir) == "behavior":
+        activity_data = load_behavior_dimension(run_dir, "activity")
+        known_cows = (
+            {int(c) for c in activity_data.get("cow_ids", [])} if activity_data else set()
+        )
+        assigned_ids = {
+            int(final_id) for final_id in id_mapping.mapping.values() if int(final_id) > 0
+        }
+        new_cow_ids = sorted(assigned_ids - known_cows)
+        if new_cow_ids:
+            register_late_behavior_cows(run_dir, new_cow_ids, frame_idx)
     
     # Update meta if needed
     n_ids = int(meta["ids"])

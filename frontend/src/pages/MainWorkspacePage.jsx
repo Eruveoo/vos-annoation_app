@@ -540,7 +540,12 @@ export default function MainWorkspacePage({ runId, frame0Image, annotationMode, 
                         ? progress.goldenMaxIdx
                         : 0
                   }
-                  onCorrectionApplied={loadProgress}
+                  onCorrectionApplied={() => {
+                    loadProgress();
+                    if (isBehaviorMode) {
+                      setBehaviorTimelineRefresh((t) => t + 1);
+                    }
+                  }}
                 />
               )}
             </div>
