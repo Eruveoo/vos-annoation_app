@@ -6,7 +6,7 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/mnt/c/Users/micha/Desktop/vos-annoation_app}"
 VENV="${VENV:-$HOME/app_venv/bin/activate}"
 
-cd "$PROJECT_DIR"
+cd "$PROJECT_DIR/backend"
 # shellcheck source=/dev/null
 source "$VENV"
 

@@ -4,9 +4,11 @@ import IDAssignmentTable from "../IDAssignmentTable.jsx";
 import { matchInitIds, previewInitUpdate } from "../api.js";
 import {
   ANNOTATION_MODES,
+  BEHAVIOR_DIMENSION_SHORT_TITLES,
   DEFAULT_BEHAVIOR_LABEL_ID,
   DEFAULT_LABEL2_LABEL_ID,
   DEFAULT_LABEL3_LABEL_ID,
+  labelNameFi,
 } from "../behaviorLabels.js";
 
 export default function IDAssignmentPage({
@@ -135,7 +137,8 @@ export default function IDAssignmentPage({
           </div>
           {isBehaviorMode && (
             <p style={{ margin: 0, fontSize: 14, color: "#6c757d", lineHeight: 1.5 }}>
-              Label 1 (Aktivisuus) is required. Labels 2 and 3 default to &quot;Ei valittu&quot;. You can
+              {BEHAVIOR_DIMENSION_SHORT_TITLES.activity} is required. Labels 2 and 3 default to &quot;
+              {labelNameFi(DEFAULT_LABEL2_LABEL_ID, "label2")}&quot;. You can
               update all labels later on the Golden tab.
             </p>
           )}

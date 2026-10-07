@@ -35,6 +35,8 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy,
+      // behaviorLabels.js imports ../backend/config/behavior_labels(.local).json.
+      fs: { allow: [".."] },
     },
     preview: {
       proxy,

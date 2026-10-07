@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "dimensions": {
+    "activity": {
+      "title_fi": "Label 1: Activity",
+      "short_title_fi": "L1 Activity",
+      "default_label": "stand",
+      "required": true,
+      "labels": [
+        {
+          "id": "walk",
+          "name_fi": "Walking",
+          "description_fi": "Placeholder label. The animal moves forward at a walking pace. Replace with your own definition."
+        },
+        {
+          "id": "stand",
+          "name_fi": "Standing",
+          "description_fi": "Placeholder label. The animal stands still on all four legs. Replace with your own definition."
+        },
+        {
+          "id": "lying",
+          "name_fi": "Lying",
+          "description_fi": "Placeholder label. The animal is lying down. Replace with your own definition."
+        },
+        {
+          "id": "other_activity",
+          "name_fi": "Other activity",
+          "description_fi": "Placeholder label. Any activity not covered by the labels above."
+        },
+        {
+          "id": "not_visible",
+          "name_fi": "Not visible",
+          "description_fi": "The animal is not visible in the frame (required id, used automatically before an animal is first detected)."
+        }
+      ]
+    },
+    "label2": {
+      "title_fi": "Label 2: Action",
+      "short_title_fi": "L2 Action",
+      "default_label": "none",
+      "required": false,
+      "labels": [
+        {
+          "id": "none",
+          "name_fi": "None",
+          "description_fi": "No action from this dimension (required id).",
+          "group_fi": "General"
+        },
+        {
+          "id": "eat",
+          "name_fi": "Eating",
+          "description_fi": "Placeholder label. The animal is eating. Replace with your own definition.",
+          "group_fi": "Example group A"
+        },
+        {
+          "id": "drink",
+          "name_fi": "Drinking",
+          "description_fi": "Placeholder label. The animal is drinking. Replace with your own definition.",
+          "group_fi": "Example group A"
+        },
+        {
+          "id": "social_actor",
+          "name_fi": "Social interaction (actor)",
+          "description_fi": "Placeholder label. The animal initiates an interaction with another animal. Replace with your own definition.",
+          "group_fi": "Example group B"
+        },
+        {
+          "id": "other_action",
+          "name_fi": "Other action",
+          "description_fi": "Placeholder label. Any action not covered by the labels above.",
+          "group_fi": "General"
+        },
+        {
+          "id": "not_seen",
+          "name_fi": "Not seen",
+          "description_fi": "The action cannot be observed, e.g. the relevant body part is hidden (required id).",
+          "group_fi": "General"
+        }
+      ]
+    },
+    "label3": {
+      "title_fi": "Label 3: Receiver",
+      "short_title_fi": "L3 Receiver",
+      "default_label": "none",
+      "required": false,
+      "labels": [
+        {
+          "id": "none",
+          "name_fi": "None",
+          "description_fi": "The animal is not the receiver of an interaction (required id)."
+        },
+        {
+          "id": "social_receiver",
+          "name_fi": "Social interaction (receiver)",
+          "description_fi": "Placeholder label. Another animal initiates an interaction with this animal. Replace with your own definition."
+        }
+      ]
+    }
+  }
+}

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { deleteBehaviorLabel, getBehavior, setBehaviorLabel } from "./api.js";
 import {
   BEHAVIOR_DIMENSIONS,
+  BEHAVIOR_DIMENSION_SHORT_TITLES,
   BEHAVIOR_DIMENSION_TITLES,
   BEHAVIOR_LABELS_BY_DIMENSION,
   labelNameFi,
@@ -554,11 +555,14 @@ export default function BehaviorTimeline({
     return out;
   }, [dimensions]);
 
-  const DIM_ROW_LABEL = {
-    activity: "L1 Aktivisuus",
-    label2: "L2 Toimija",
-    label3: "L3 Vastaanottaja",
-  };
+  const DIM_ROW_LABEL = BEHAVIOR_DIMENSION_SHORT_TITLES;
+  const neutralLegend = [
+    ...new Set([
+      labelNameFi("none", "label2"),
+      labelNameFi("not_seen", "label2"),
+      labelNameFi("not_visible", "activity"),
+    ]),
+  ].join(" / ");
 
   const totalFrames = Math.max(1, maxFrame + 1);
   const playheadPct = maxFrame > 0 ? (currentFrame / maxFrame) * 100 : 0;
@@ -707,7 +711,7 @@ export default function BehaviorTimeline({
             marginRight: 6,
           }}
         />
-        Grey = Ei valittu / Ei näy / Ei näkyvissä
+        Grey = {neutralLegend}
       </div>
 
       <div style={{ display: "flex", gap: COL_GAP, alignItems: "flex-start" }}>

@@ -1,6 +1,7 @@
 import React from "react";
 import {
   BEHAVIOR_DIMENSION_TITLES,
+  DEFAULT_BEHAVIOR_LABEL_ID,
   labelsForInitSelect,
 } from "./behaviorLabels.js";
 
@@ -173,7 +174,7 @@ export default function IDAssignmentTable({
                           "activity",
                           behaviorMapping,
                           onBehaviorMappingChange,
-                          "stand"
+                          DEFAULT_BEHAVIOR_LABEL_ID
                         )}
                       </td>
                       <td style={{ padding: "8px 6px", border: "1px solid #ddd", textAlign: "center" }}>

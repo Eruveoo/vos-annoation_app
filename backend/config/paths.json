@@ -1,0 +1,8 @@
+{
+  "runs_root": "runs",
+  "torch_cache_dir": "cache/torch",
+  "tmp_dir": "cache/tmp",
+  "xmem_repo": "XMem",
+  "xmem_model": "XMem/saves/XMem.pth",
+  "ffmpeg_module": null
+}
