@@ -154,7 +154,7 @@ export default function VideoSelectionPage({
         {/* Top bar */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
           <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.3, color: "#212529" }}>
-            VOS Annotation App
+            JISTBA
           </div>
 
           {connectionStatus !== null && (

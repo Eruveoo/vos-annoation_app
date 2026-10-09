@@ -30,7 +30,7 @@ export default function InitializePage({ videoPath, runId, onInitialized, onBack
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto", padding: 24 }}>
-      <h1 style={{ marginTop: 0, marginBottom: 32 }}>VOS Annotation App</h1>
+      <h1 style={{ marginTop: 0, marginBottom: 32 }}>JISTBA</h1>
 
       <div
         style={{

@@ -1,6 +1,6 @@
-# VOS Annotation App
+# JISTBA: Joint Instance Segmentation, Tracking and Behaviour Annotation
 
-A web-based video object segmentation (VOS) annotation application that uses SAM-3 for mask initialization and XMem for tracking, with optional per-cow behaviour annotation.
+JISTBA is a web-based annotation tool for videos of animals. It uses SAM-3 for instance segmentation (mask initialization), XMem for tracking the instances across frames, and supports per-animal behaviour annotation on a timeline.
 
 ## Overview
 

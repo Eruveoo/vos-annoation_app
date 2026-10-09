@@ -20,12 +20,18 @@ PATHS_LOCAL_CONFIG_FILE = Path(
 )
 
 
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON: {e}") from None
+
+
 def _load_paths_config() -> Dict[str, Any]:
-    with PATHS_CONFIG_FILE.open(encoding="utf-8") as f:
-        config = json.load(f)
+    config = _read_json(PATHS_CONFIG_FILE)
     if PATHS_LOCAL_CONFIG_FILE.exists():
-        with PATHS_LOCAL_CONFIG_FILE.open(encoding="utf-8") as f:
-            local = json.load(f)
+        local = _read_json(PATHS_LOCAL_CONFIG_FILE)
         unknown = set(local) - set(config)
         if unknown:
             raise ValueError(f"{PATHS_LOCAL_CONFIG_FILE}: unknown keys {sorted(unknown)}")

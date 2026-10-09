@@ -1,4 +1,4 @@
-"""VOS annotation backend: FastAPI app entry point (run: uvicorn server:app)."""
+"""JISTBA backend: FastAPI app entry point (run: uvicorn server:app)."""
 import os
 import shutil
 import subprocess
@@ -8,11 +8,11 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from vos.config import PATHS_CONFIG, log
+from vos.config import PATHS_CONFIG, XMEM_MODEL, XMEM_REPO, log
 from vos.routes import upload, init_ids, behavior, tracking, frames, correction, mask_editing, results
 
 
-app = FastAPI()
+app = FastAPI(title="JISTBA: Joint Instance Segmentation, Tracking and Behaviour Annotation")
 
 # Add CORS middleware to allow frontend requests
 # Allow all origins for development (restrict in production)
@@ -59,6 +59,11 @@ async def log_requests(request: Request, call_next):
 async def startup_load_ffmpeg():
     """Startup: quiet access logs for poll endpoints; load ffmpeg if missing."""
     logging.getLogger("uvicorn.access").addFilter(_QuietAccessLogFilter())
+
+    if not (XMEM_REPO / "eval.py").exists():
+        log.warning(f"XMem repository not found at {XMEM_REPO} (set xmem_repo in config/paths.local.json)")
+    if not XMEM_MODEL.exists():
+        log.warning(f"XMem model not found at {XMEM_MODEL} (set xmem_model in config/paths.local.json)")
 
     if shutil.which("ffmpeg"):
         return
